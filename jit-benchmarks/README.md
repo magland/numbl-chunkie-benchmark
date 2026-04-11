@@ -67,19 +67,20 @@ per-stage details and the V8 findings behind the improvements.
 
 | stage | matlab | numbl (initial) | numbl (current) | current ratio | jit fires? |
 | --- | --- | --- | --- | --- | --- |
-| stage_01_scalar_arith        |  58ms |  320ms |  286ms |  4.94x | yes |
-| stage_02_scalar_tensor_reads |  72ms | 1.311s |  195ms |  2.71x | yes |
-| stage_03_nested_with_compare |  54ms |  933ms |  105ms |  1.94x | yes |
-| stage_04_scalar_write        |  25ms | 4.188s |   29ms |  1.17x | yes |
-| stage_05_slice_read          |  92ms | 6.509s |   24ms |  0.26x | yes |
-| stage_06_slice_write         |  97ms | 6.653s | 7.176s | 73.73x | **no** |
-| stage_07_while_stack         |  32ms | 8.893s |   43ms |  1.33x | yes |
-| stage_08_full_bvh_query      | 101ms | 7.532s | 7.679s | 76.09x | sub-loops yes, outer no |
+| stage_01_scalar_arith        |  57ms |  320ms |  300ms |  5.24x | yes |
+| stage_02_scalar_tensor_reads |  79ms | 1.311s |  204ms |  2.57x | yes |
+| stage_03_nested_with_compare |  46ms |  933ms |   97ms |  2.12x | yes |
+| stage_04_scalar_write        |  29ms | 4.188s |   27ms |  0.93x | yes |
+| stage_05_slice_read          | 101ms | 6.509s |   23ms |  0.22x | yes |
+| stage_06_slice_write         |  97ms | 6.653s |   34ms |  0.35x | yes |
+| stage_07_while_stack         |  36ms | 8.893s |   48ms |  1.32x | yes |
+| stage_08_full_bvh_query      | 101ms | 7.532s |   58ms |  0.57x | yes |
 
-Stages 4, 5, and 7 are all within 35% of matlab; stage 5 actually
-**beats matlab by ~4×** (slice reads substitute directly into scalar reads
-on the base tensor — no per-iter allocation, V8 hits the same fast path
-as stages 2-3). Stages 6 and 8 still need slice-write JIT support.
+**All eight stages JIT cleanly.** Stages 4–6 and 8 actually beat matlab
+(ratio < 1×); stage 5 by ~4.5×. Stage 8, the **ambitious target**, JITs
+as a single loop and runs ~1.7× faster than matlab. Stages 1–3 and 7
+remain within ~5× of matlab — the residual gap on stage 1 is the V8
+ceiling vs. matlab's JIT and isn't something the codegen can close.
 
 ## Capability staging plan (numbl side)
 
@@ -90,9 +91,9 @@ Each stage corresponds to a specific gap in
 |---|---|---|
 | 04 scalar_write | Handle `Stmt: AssignLValue` whose lvalue is `Index` with **scalar** indices on a tensor base. Codegen `$h.set1r_h(...)` etc. | **done** |
 | 05 slice_read | Handle `Expr: Colon` inside an `Index`/`FuncCall` base. Implemented as a "slice alias": `pt = pts(:, i)` doesn't allocate anything — it's recorded as a substitution rule, and subsequent reads `pt(k)` rewrite into direct scalar reads on the source tensor. No codegen changes needed. | **done** |
-| 06 slice_write | Handle `Stmt: AssignLValue` whose lvalue is `Index` with at least one `Range`/`Colon`. Codegen `$h.setSlice(...)`. | todo |
+| 06 slice_write | Handle `Stmt: AssignLValue` whose lvalue is `Index` with a `Range` index. Codegen `$h.setRange1r_h(...)`. Also relax the codegen hoist pass to refresh hoisted aliases after every plain Assign to a hoisted tensor — required because the chunkie growth pattern reassigns the dst tensor inside the loop. | **done** |
 | 07 while_stack | No new lowering needed. | **done** (free after stage 4) |
-| 08 full target | All of the above must be in place. | sub-loops JIT; outer bails on slice write |
+| 08 full target | All of the above must be in place. | **done** (the entire ptloop JITs as one loop) |
 
 Each capability lands in numbl together with a correctness test in
 `~/src/numbl/numbl_test_scripts/indexing/` (or similar). After landing

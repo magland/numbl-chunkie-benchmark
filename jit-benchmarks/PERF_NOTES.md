@@ -213,6 +213,7 @@ In commit order:
 | `d6f7ea6` JIT: hoist tensor base reads, clean conditionals, prune dead loop outputs | (1) Add `idx{1,2,3}r_h` helpers taking pre-extracted (data, len, dim sizes) args, and hoist per-tensor reads to local aliases at function entry. (2) Recursively emit JS-boolean form inside conditions in `emitTruthiness`. (3) Filter the loop output set with sibling-tail liveness via new `collectReadsFromSiblings` + `_postSiblings` plumbing. | stage 02: 227ms → 194ms (1.17x). stage 03: 241ms → 98ms (2.46x). |
 | `cb2eb8b` JIT: scalar tensor write via hoisted `unshare` | (1) New `set{1,2,3}r_h` helpers mirroring `idx{1,2,3}r_h`. (2) New `unshare(t)` helper that returns `t` if `_rc <= 1` else a fresh copy. (3) New `AssignIndex` JIT IR node. (4) `lowerAssignLValue` handles `t(i)=v` with 1-3 scalar indices on real tensors. (5) Codegen's hoist pass was loosened so write-target tensor params go through `unshare` once at function entry and then hoist data/len/shape like the read-only case. | stage 04: 4188ms → 31ms (**135×**, ratio 0.98× matlab). stage 07: 8893ms → 44ms (**202×**, ratio 1.20× matlab — it auto-JIT'd because while-stack only needed scalar push/pop). |
 | _stage-5_ JIT: colon-slice reads via "slice alias" substitution | (1) New `SliceAlias` type in lowerCtx: a map from MATLAB local → `{ baseName, template, sliceShape }` where `template` is per-dim `{kind: "colon"} \| {kind: "expr", expr}`. No RuntimeTensor is materialized for the slice. (2) `tryLowerAsSliceBind` recognizes `name = base(:, i, ...)` (both Index and FuncCall forms — the parser produces FuncCall when it can't disambiguate), captures each non-literal scalar index into a tmp local to freeze bind-time values (MATLAB semantics), and emits the tmp Assigns only. (3) Index reads of aliased names substitute back into a direct scalar read on the base tensor, which flows through the existing hoisted `idx{1,2,3}r_h` fast path. (4) Slice aliases are lexically scoped — snapshot/restore in lowerFor/While/If so aliases don't leak across branches or past loop exits. (5) Codegen needed zero changes: slice-bind emits plain Assigns and slice-reads emit plain Index JitExprs. | stage 05: **6552ms → 22ms (~300×, ratio 0.25× matlab — 4× faster than matlab)**. Stage 08 outer driver still bails (needs slice writes), but its sub-loops that are pure scalar-in-body now lower cleanly. |
+| _stage-6_ JIT: range-slice writes + hoist-refresh on plain reassign | (1) New `setRange1r_h(dstData, dstLen, dstStart, dstEnd, srcData, srcLen, srcStart, srcEnd)` helper that bounds-checks both halves and does a `dstData.set(srcData.subarray(...), dstStart-1)` copy. The TypedArray `set` clones the source first when ranges overlap, so same-tensor self-copy is safe. (2) New `AssignIndexRange` JIT IR node carrying both dst and src tensor names + their range start/end JitExprs. (3) `tryLowerRangeAssign` in lowerAssignLValue recognizes the narrow `dst(a:b) = src(c:d)` shape (LHS Index with one Range index, RHS either Index or FuncCall with one Range arg, both real tensors). (4) **The big change in jitCodegen.ts**: replaced the param-only hoist pass with `collectTensorUsage`, an IR walker that collects per-tensor read/write arity from `Index`/`AssignIndex`/`AssignIndexRange`. This makes hoisting eligible for **locals AND reassigned params**, not just read-only params. (5) `emitHoistRefresh`, called after every plain `Assign` to a hoisted tensor name, re-reads `.data`/`.length`/`.shape` (and re-runs `unshare` if it's a write target) so subsequent reads/writes see the new tensor object. This is what makes the chunkie grow-and-copy pattern (`out_pt = zeros(N*2, 1); out_pt(1:N) = tmp_pt(1:N); ...; out_pt(nhit) = i`) JIT cleanly. (6) `emitAssignIndexRange` emits a single `$h.setRange1r_h(...)` call using both hoisted aliases. | stage 06: **6881ms → 33ms (~210×, ratio 0.35× matlab — 3× faster than matlab)**. Stage 08: **7532ms → 58ms (~130×, ratio 0.57× matlab — ~2× faster than matlab)** — the entire ptloop now JITs as a single loop function, hitting the ambitious target. |
 
 ## Cumulative results vs. the original baseline
 
@@ -221,33 +222,30 @@ are run-to-run noise (~10% spread).
 
 | stage | matlab | numbl before | numbl after | speedup | ratio (nb/ml) |
 |---|---|---|---|---|---|
-| stage_01_scalar_arith | ~58ms | ~320ms | ~286ms | 1.12× | 4.94× |
-| stage_02_scalar_tensor_reads | ~72ms | ~1311ms | ~195ms | **6.72×** | 2.71× |
-| stage_03_nested_with_compare | ~54ms | ~933ms | ~105ms | **8.89×** | 1.94× |
-| stage_04_scalar_write | ~25ms | ~4188ms | **~29ms** | **144×** | **1.17×** |
-| stage_05_slice_read | ~92ms | ~6509ms | **~24ms** | **271×** | **0.26×** |
-| stage_06_slice_write | ~97ms | ~6881ms | (still no JIT — bails on `t(a:b)=v`) | — | — |
-| stage_07_while_stack | ~32ms | ~8893ms | **~43ms** | **207×** | **1.33×** |
-| stage_08_full_bvh_query | ~101ms | ~7532ms | (2 sub-loops JIT, outer bails on slice write) | — | — |
+| stage_01_scalar_arith | ~57ms | ~320ms | ~300ms | 1.07× | 5.24× |
+| stage_02_scalar_tensor_reads | ~79ms | ~1311ms | ~204ms | **6.43×** | 2.57× |
+| stage_03_nested_with_compare | ~46ms | ~933ms | ~97ms | **9.62×** | 2.12× |
+| stage_04_scalar_write | ~29ms | ~4188ms | **~27ms** | **155×** | **0.93×** |
+| stage_05_slice_read | ~101ms | ~6509ms | **~23ms** | **283×** | **0.22×** |
+| stage_06_slice_write | ~97ms | ~6881ms | **~33ms** | **208×** | **0.35×** |
+| stage_07_while_stack | ~36ms | ~8893ms | **~48ms** | **185×** | **1.32×** |
+| stage_08_full_bvh_query | ~101ms | ~7532ms | **~58ms** | **130×** | **0.57×** |
 
-**Stage 5 is the current record: 0.26× matlab (4× faster).** The slice-alias
+**Stage 5 is the record: 0.22× matlab (~4.5× faster).** The slice-alias
 approach turns `pt = pts(:, i); pxi = pt(1); pyi = pt(2)` into two
-direct hoisted scalar reads on `pts`, with zero runtime allocation. V8
-then hits the same fast path that stages 2–3 converged on, and closes
-the matlab gap entirely.
+direct hoisted scalar reads on `pts`, with zero runtime allocation.
 
-**Stage 7 was a free win from stage 4.** It uses the while-loop push/pop
-pattern on an integer stack tensor, which only needs scalar indexed
-read and scalar indexed write — both of which stage 4 enables. No
-stage-7-specific changes were needed; it auto-JIT'd as soon as scalar
-writes landed.
+**Stage 8 — the ambitious target — is now JIT'ing as a single loop and
+beats matlab by ~1.7×.** Stages 4–6 and 8 all run faster than matlab.
+The chunkie grow-and-copy growth path (`out_pt = zeros(N*2, 1);
+out_pt(1:N) = tmp_pt(1:N)`) compiles cleanly because (a) the new
+`AssignIndexRange` IR + `setRange1r_h` helper handle the slice write
+itself and (b) the codegen hoist pass now refreshes hoisted aliases
+after every plain `Assign` to a hoisted tensor, so the post-`zeros`
+`out_pt(nhit) = i` writes go through the new buffer.
 
-**Stage 8 is still only partially JIT'd.** Two of its inner sub-loops
-(the BVH-walk sibling-traversal loops) compile cleanly and the outer
-driver now slices cleanly too via stage 5, but the outer driver still
-bails because the grow-and-copy path uses slice-write (`out_pt(1:nout_max)
-= tmp_pt(1:nout_max)`). Once stage 6 lands, stage 8 should collapse as
-well.
+**Stage 7 was a free win from stage 4** — while-loop push/pop on an
+integer stack tensor only needs scalar indexed read+write.
 
 **Stage 1 is at the V8 ceiling.** Verified by hand-writing the exact
 generated JS and timing it under bare `node`: pure JS = 342ms, our JIT
@@ -261,31 +259,74 @@ inlining at the call site (which the user wants to avoid for codegen
 cleanness) or convincing V8 to bake the hoisted-rows constant. Not
 worth pursuing until stages 4-8 land.
 
-## What's next: stages 6, 8 (JIT coverage)
+## What's next
 
-Stages 4, 5, and 7 are done. What's left:
+All eight staged benchmarks now JIT and the ambitious target (stage 8)
+runs faster than matlab. Possible follow-ups:
 
-- **stage 6** — `AssignLValue: Index(range...)`. Slice-write helper
-  like `setSlice1r_h(dst, srcData, srcOff, len, dstStart)`. The
-  obvious implementation path is a range-range copy (`Float64Array.set`
-  with a subarray view), but the common chunkie pattern is `isp(1:nn) =
-  itemp` with a range-range where the src is another tensor, not a
-  range expression. Handle at least:
-  * `dst(a:b) = src(a:b)` (range slice write from a range slice read)
-  * `dst(:, i) = src(:, j)` (column-colon write from column-colon read
-    — same shape)
-  For now, skip the `Expr: Range` form entirely except as the inside of
-  an `Index` — range expressions as first-class tensor values are out of scope.
-- **stage 8** — combines stages 4-7 in the BVH walker. The two sub-loops
-  already JIT and the query's outer slice read (`pt = pts(:, i)`) now
-  works via stage 5. The outer driver still bails on the grow-and-copy
-  slice-write path (`out_pt(1:nout_max) = tmp_pt(1:nout_max)`), which
-  is the core of what stage 6 must add. Should JIT cleanly once stage 6
-  lands.
+- **stage 1–3 / 7 polish** — these are within ~5× of matlab. Stage 1
+  is at the V8 ceiling for pure scalar arithmetic and probably can't
+  be moved. Stages 2/3 have residual headroom from inline-at-call-site
+  tensor reads (~2× per the standalone bisection notes). Stage 7 is
+  while+scalar-write at parity with stage 4, so the same headroom
+  applies.
+- **multi-dim slice writes** — current stage 6 only handles linear
+  range writes (`dst(a:b) = src(c:d)`). Multi-dim shapes like
+  `dst(:, j) = src(:, k)` aren't yet supported. Not needed for the
+  chunkie ptloop (stage 8 only uses linear range), but useful for
+  other patterns.
+- **stepped ranges** — `setRange1r_h` assumes step=1. A stepped variant
+  would need a per-element loop in the helper rather than `Float64Array.set`.
+- **slice writes from a scalar fill** — `dst(a:b) = 5`. A different
+  helper (`fillRange1r_h`) and a different lowering path. Not needed
+  for the chunkie pattern.
+- **complex-tensor variants of all the above**.
 
 Each of these lands with a corresponding correctness test in
 `numbl/numbl_test_scripts/indexing/` plus a re-measurement of the
 matching jit-benchmark stage.
+
+## What was learned landing stage 6
+
+- **The hoist pass had to switch from "param-based" to "IR-walking".**
+  The previous hoist pass iterated `params` and checked param types
+  against `paramTypes`. That worked for stages 1–5 because none of them
+  reassigned a hoisted tensor inside the loop body. Stage 6's chunkie
+  growth path reassigns `out_pt` to a fresh `zeros(N*2, 1)` mid-loop,
+  which breaks the param-based hoist (the alias would be stale after
+  the first growth) and also doesn't hoist `tmp_pt` at all (it's a pure
+  local). The replacement is `collectTensorUsage`, which walks the IR
+  to find every variable used as the base of any `Index` /
+  `AssignIndex` / `AssignIndexRange`, then hoists each one — params get
+  entry-time initialization, locals get the alias declared
+  uninitialized and filled by the per-Assign refresh.
+- **Per-Assign hoist refresh is the key piece.** After every plain
+  `Assign` to a hoisted tensor name, codegen emits
+  `name = $h.unshare(name); $name_data = name.data; ...`. For
+  fresh-from-`zeros(...)` tensors `unshare` is a no-op fast return on
+  `_rc <= 1`, so the refresh costs four register loads per growth
+  event — amortized over thousands of subsequent scalar writes, it's
+  invisible. This is what makes both `out_pt = zeros(N*2, 1);
+  out_pt(1:N) = tmp_pt(1:N)` AND the trailing `out_pt(nhit) = i` go
+  through the new buffer correctly.
+- **`AssignIndexRange` carries both dst and src names directly.** The
+  IR doesn't lower the src as an `Index` JitExpr because there's no
+  scalar value to materialize — we just need the src tensor's data
+  pointer + range bounds, which the codegen pulls from the hoisted
+  alias. This keeps `setRange1r_h` simple (eight scalar args) and lets
+  V8 inline it.
+- **`Float64Array.set(srcSubarray, dstStart)` handles overlap natively.**
+  ECMA-262 §23.2.3.26 says TypedArray#set with a TypedArray source
+  clones the source first when buffers alias, so same-tensor self-copy
+  (`s(1:5) = s(6:10)`) is safe even though the chunkie pattern itself
+  uses different buffers. Verified by case 6 in
+  `test_loop_slice_write.m`.
+- **Stage 8 collapsed cleanly.** Once stages 5 and 6 were both in
+  place, stage 8's full BVH-walk ptloop JIT'd as a single outer-for
+  loop function — no extra work needed. The two inner sub-loops, the
+  while-stack walker, the slice-aliased `pt = pts(:, i)`, the scalar
+  writes to `out_pt`/`out_rect`, AND the slice-write growth path all
+  compile inside one `$loop_for` function. From 7532ms → 58ms (~130×).
 
 ## What was learned landing stage 5
 
@@ -375,10 +416,10 @@ same pattern comes up for stages 5-6:
 
 ## Current branch state (for resuming after compaction)
 
-- numbl: `main` at `9318236` — stage 5 committed locally, **not pushed**.
+- numbl: stage 6 committed locally on `main`, **not pushed**.
   Working tree clean.
-- numbl-chunkie-benchmark: `main` at `ff5fe2c` — stage 5 notes committed
-  locally, **not pushed**. Working tree clean.
+- numbl-chunkie-benchmark: stage 6 docs committed locally on `main`,
+  **not pushed**. Working tree clean.
 
 The numbl commits made so far for the loop JIT work, in order:
 - `34d107a` Fix --dump-js double-printing JIT compilations
@@ -388,46 +429,15 @@ The numbl commits made so far for the loop JIT work, in order:
 - `cb2eb8b` JIT: scalar tensor write via hoisted unshare (**stage 4**)
 - `950d413` Remove obsolete numbl_test_scripts/jit/ and %!jit annotation matcher
 - `9318236` JIT: slice reads via alias substitution (**stage 5**)
+- _stage 6 commit hash filled in after `git commit`_
 
 The benchmark commits:
 - `52ffa21` Add jit-benchmarks suite for staged loop-JIT improvements
 - `a8f95d0` PERF_NOTES: add stage 4 implementation guide and branch state
 - `be1ca40` PERF_NOTES + README: stage 4 landed (scalar tensor write)
 - `ff5fe2c` PERF_NOTES + README: stage 5 landed (slice reads)
-
-## State when paused for compaction
-
-Stage 5 is fully landed (implementation, test, benchmark update, PERF
-notes update, commits in both repos). **Nothing is pushed yet.**
-
-Immediately before compaction the plan was to start **stage 6: slice
-writes**. Notes on the stage 6 design decision in case it's the same
-when resuming:
-
-- The chunkie pattern that matters is `out(1:nout) = src(1:nout)` — a
-  range-slice write from a range-slice read of another tensor, both
-  with the same length. This is what stage 8's grow-and-copy path
-  uses, and it's the only slice-write shape stage 6's benchmark
-  exercises. See `stages/stage_06_slice_write.m`.
-- The natural implementation approach is the mirror of stage 5's
-  slice-read: a new `$h.setSliceRange_h(dstData, dstLen, dstStart,
-  dstEnd, srcData, srcLen, srcStart, srcEnd)` helper that does a
-  bounds-checked `Float64Array.set(src.subarray(...), dstStart-1)`.
-  Unlike slice reads, slice writes DO need codegen (a new IR node or
-  an extension of `AssignIndex` to carry ranges).
-- `Expr: Range` lowering is already needed for the indices of both the
-  LHS and the RHS. It doesn't need a full JitExpr-producing form —
-  only a "range slot" that can sit inside an `Index` lvalue/rvalue.
-  A minimal shape would be `{ tag: "RangeSlot"; start: JitExpr; end:
-  JitExpr; step: JitExpr | null }` that's only allowed as an index
-  argument.
-- The write-target must be a real tensor already in the hoist-unshare
-  path (stage 4 work), so the helper can go directly through
-  `<dst>_data` without needing per-write unshare.
-- Correctness test should cover (a) same-length range copy, (b) copy
-  from a subrange of a different tensor, (c) interaction with scalar
-  writes to the same tensor (the unshare-once-at-entry strategy must
-  still work).
+- `14298fb` PERF_NOTES: branch state with stage-5 commit hashes
+- _stage 6 doc commit hash filled in after `git commit`_
 
 ## Cheat sheet for the next session
 
