@@ -259,29 +259,26 @@ inlining at the call site (which the user wants to avoid for codegen
 cleanness) or convincing V8 to bake the hoisted-rows constant. Not
 worth pursuing until stages 4-8 land.
 
-## What's next: stages 10–14 (struct-of-struct chunkie ptloop)
+## What's next: stages 11–14 (struct-of-struct chunkie ptloop)
 
-Stages 1–9 are done — the flat-tensor BVH walker (stage 8) JITs as a
-single loop and beats matlab, and stage 9 added the whole-tensor-RHS
-slice-write shape. The remaining lineup, **stages 10–14**, pushes
-toward making the actual chunkie `flagnear_rectangle.m` JIT cleanly
-without a flat-tensor refactor.
+Stages 1–10 are done — the flat-tensor BVH walker (stage 8) JITs as a
+single loop and beats matlab, stage 9 added the whole-tensor-RHS
+slice-write shape, and stage 10 folded the `and()`/`or()`/`not()`
+function-call forms to JS operators. The remaining lineup, **stages
+11–14**, pushes toward making the actual chunkie `flagnear_rectangle.m`
+JIT cleanly without a flat-tensor refactor.
 
 The chunkie ptloop has three remaining constructs that the current JIT
-bails on (plus one perf gap):
+bails on:
 
 1. **Empty matrix init + vertical concat growth** (`it = []; it = [it; i]`)
 2. **Struct array field access** (`T.nodes(inode).chld`, `T.nodes(inode).xi`)
 3. **Scalar struct field read** (`opts.k`, `chnkr.nch`)
-4. (perf only) **`and(...)`/`or(...)` function-call form in conditions** — lowers but ~3× slower than the operator form because it routes through the IBuiltin call path
 
-Plus everything from stages 1–9 is needed.
+Plus everything from stages 1–10 is needed.
 
 The new stages decompose these capabilities one at a time:
 
-- **stage 10** — fold `and()`/`or()` to JS `&&`/`||`. Pure perf
-  optimization; the JIT already lowers the function-call form via the
-  IBuiltin path.
 - **stage 11** — empty matrix literal + vertical concat growth. Needs a
   new tensor-allocate-and-copy helper plus type unification across the
   empty→non-empty transition.
@@ -508,87 +505,64 @@ same pattern comes up for stages 5-6:
   a single lowering is enough — we don't need re-specialization when
   the refcount changes.
 
-## Current branch state (for resuming after compaction)
+## What was learned landing stage 10
 
-- numbl: stages 1–9 landed. Stage 9 at `c63e4f5`
-  ("JIT: range-slice write with whole-tensor source (stage 9)"). The
-  numbl test is `numbl_test_scripts/indexing/test_loop_slice_write_var_src.m`.
-  All commits local, **not pushed**.
-- numbl-chunkie-benchmark: stage 9 docs at `5de6f42`. Stages 10–14
-  still in the WIP lineup (10 lowers with perf gap; 11–14 BAIL).
+Stage 10 was the smallest stage by far — about 50 lines added to one
+file plus a 100-line correctness test. The fold lives in `lowerExpr`
+case `"FuncCall"` in `jitLower.ts`, right after the slice-alias check
+and before `lowerUserFuncCall`. Key points:
 
-### Next: stage 10 implementation sketch
+- **Place the fold AFTER the variable-shadowing check, not before.**
+  The existing `varType = ctx.env.get(expr.name)` branch handles
+  `and = 5; ... and(i)` (treat as indexing) — leaving that path
+  intact means the fold only fires when the name is genuinely a
+  builtin call.
+- **Restrict to plain `number`/`boolean` operands, not the broader
+  `isScalarType`.** `isScalarType` returns true for `complex_or_number`
+  too, but JS `&&` uses JavaScript truthiness which doesn't match
+  MATLAB's complex truthiness rule (`any([real, imag]) ~= 0`).
+  Conservative scope here keeps the IBuiltin fallback for the complex
+  case (which the chunkie loop never hits anyway).
+- **No shadowing check needed for `lowerUserFuncCall`.** In principle a
+  user could define `and.m`, but (a) `and`/`or`/`not` are MATLAB
+  language builtins that user code essentially never overrides, and
+  (b) calling a user `and.m` from JIT-able numerical code would be
+  bizarre. The variable-shadowing check above is sufficient defense.
+- **Result type is `{ kind: "boolean" }`**, not `number`. This matches
+  what the operator form `&&`/`||`/`~` already produces (see
+  `binaryResultType` for `BinaryOperation.AndAnd` and `unaryResultType`
+  for `UnaryOperation.Not`), so downstream type unification at loop
+  joins behaves identically to the operator form.
+- **The fold dispatches `lowerExpr` on the args** before falling
+  through. If arg lowering fails for the and/or fold, we fall through
+  to the IBuiltin path which will re-lower them. This double-lower is
+  cheap because lowering happens once per compile, not per iteration.
 
-Stage 10 is the smallest of the remaining stages — pure perf, no
-correctness gap. The `and(a,b)` / `or(a,b)` / `not(a)` function-call
-forms already lower through the IBuiltin path
-(`$h.ib_and(...)` / `ib_or(...)` / `ib_not(...)`). Current stage 10
-ratio is 2.92× matlab (170ms → 497ms) because those helpers go
-through the general Var-dispatch path instead of folding to JS `&&`
-/`||`/`!`.
+Generated JS (from the dumped stage 10 loop):
 
-Fix: in `lowerExpr` case `"FuncCall"` in
-[jitLower.ts:1260](../../numbl/src/numbl-core/interpreter/jit/jitLower.ts#L1260),
-immediately after the `assert_jit_compiled` elision (~line 1275) and
-before the `varType = ctx.env.get(expr.name)` lookup, recognize the
-three names when **not** shadowed by a local and when args are scalar:
-
-```ts
-if (
-  !ctx.env.has(expr.name) &&
-  (expr.name === "and" || expr.name === "or") &&
-  expr.args.length === 2
-) {
-  const left = lowerExpr(ctx, expr.args[0]);
-  if (!left) return null;
-  const right = lowerExpr(ctx, expr.args[1]);
-  if (!right) return null;
-  if (!isScalarType(left.jitType) || !isScalarType(right.jitType)) {
-    // tensor args: fall through to the IBuiltin path
-  } else {
-    const op = expr.name === "and"
-      ? BinaryOperation.AndAnd : BinaryOperation.OrOr;
-    return {
-      tag: "Binary", op, left, right,
-      jitType: { kind: "boolean" },
-    };
-  }
-}
-if (
-  !ctx.env.has(expr.name) &&
-  expr.name === "not" &&
-  expr.args.length === 1
-) {
-  const operand = lowerExpr(ctx, expr.args[0]);
-  if (!operand) return null;
-  if (isScalarType(operand.jitType)) {
-    return {
-      tag: "Unary", op: UnaryOperation.Not, operand,
-      jitType: { kind: "boolean" },
-    };
-  }
-}
+```js
+if (((a) > (2)) && ((b) < (8))) { ... }   // and(a > 2, b < 8)
+if (((a) === (0)) || ((b) === (0))) { ... } // or(a == 0, b == 0)
+if (!((c) === (0))) { ... }                 // not(c == 0)
+while (((is) > (0)) && ((ntry) <= (nnodes))) { ... } // while(and(...))
 ```
 
-`isScalarType` helper is already used elsewhere in the file. Both
-`BinaryOperation` and `UnaryOperation` are already imported from
-`../../parser/types.js` at the top of the file (line 9).
+No `$h.ib_and` / `$h.ib_or` / `$h.ib_not` in the loop body. V8 inlines
+these directly the same as it does for the operator form.
 
-**Why this is safe**: (a) MATLAB's `and`/`or`/`not` builtins short-
-circuit when given scalars (same as `&&`/`||`/`~`), so semantics
-match. (b) Shadowing check via `ctx.env.has(expr.name)` prevents
-hijacking a user-local named `and`. (c) Tensor args fall through to
-the IBuiltin path unchanged so elementwise behavior is preserved.
+**Result**: stage 10 went from 2.92× matlab (170ms → 497ms) to **0.11×
+matlab** (178ms → 19ms) — about 26× faster than the IBuiltin path and
+~9× faster than matlab. The full benchmark sweep showed no regressions
+in stages 1–9.
 
-**Test**: add
-`numbl_test_scripts/expressions/test_loop_and_or_not_func_form.m` (or
-similar) with `assert_jit_compiled()` inside a loop and several
-and/or/not patterns. Verify results match the operator form.
+## Current branch state (for resuming after compaction)
 
-**Benchmark expectation**: stage_10 ratio should drop from 2.92× to
-~1× (or below) once folding fires. The generated JS should no longer
-contain `$h.ib_and` / `$h.ib_or` / `$h.ib_not` calls in the dumped
-loop body.
+- numbl: stages 1–10 landed. Stage 10 at HEAD ("JIT: fold and/or/not
+  function-call form to operator form (stage 10)"). The numbl test is
+  `numbl_test_scripts/arithmetic/test_loop_and_or_not_func_form.m`.
+  Stage 9 at `c63e4f5`. All commits local, **not pushed**.
+- numbl-chunkie-benchmark: stage 10 docs at HEAD. Stages 11–14 still
+  in the WIP lineup (all BAIL).
 
 ### Stages 11-14 gotchas (for planning ahead)
 
@@ -631,6 +605,9 @@ The numbl commits made so far for the loop JIT work, in order:
 - `950d413` Remove obsolete numbl_test_scripts/jit/ and %!jit annotation matcher
 - `9318236` JIT: slice reads via alias substitution (**stage 5**)
 - `fc76ddb` JIT: range-slice writes via setRange1r_h + hoist refresh on reassign (**stage 6 + stage 8**)
+- `7540ef6` JIT: add assert_jit_compiled() marker for staged JIT tests
+- `c63e4f5` JIT: range-slice write with whole-tensor source (**stage 9**)
+- `74ad9c1` JIT: fold and/or/not function-call form to operator form (**stage 10**)
 
 The benchmark commits:
 - `52ffa21` Add jit-benchmarks suite for staged loop-JIT improvements
@@ -639,6 +616,8 @@ The benchmark commits:
 - `ff5fe2c` PERF_NOTES + README: stage 5 landed (slice reads)
 - `14298fb` PERF_NOTES: branch state with stage-5 commit hashes
 - `9e3a765` PERF_NOTES + README: stage 6 landed (slice writes)
+- `5de6f42` PERF_NOTES + README: stage 9 landed (slice write with var source)
+- `e0c2e0e` PERF_NOTES: record stage 9 commit hash and add stage 10-14 sketches
 
 ## Cheat sheet for the next session
 
