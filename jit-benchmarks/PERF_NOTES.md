@@ -259,32 +259,96 @@ inlining at the call site (which the user wants to avoid for codegen
 cleanness) or convincing V8 to bake the hoisted-rows constant. Not
 worth pursuing until stages 4-8 land.
 
-## What's next
+## What's next: stages 9–14 (struct-of-struct chunkie ptloop)
 
-All eight staged benchmarks now JIT and the ambitious target (stage 8)
-runs faster than matlab. Possible follow-ups:
+Stages 1–8 are done — the flat-tensor BVH walker (stage 8) JITs as a
+single loop and beats matlab. The new lineup, **stages 9–14**, pushes
+toward making the actual chunkie `flagnear_rectangle.m` JIT cleanly
+without a flat-tensor refactor.
 
-- **stage 1–3 / 7 polish** — these are within ~5× of matlab. Stage 1
-  is at the V8 ceiling for pure scalar arithmetic and probably can't
-  be moved. Stages 2/3 have residual headroom from inline-at-call-site
-  tensor reads (~2× per the standalone bisection notes). Stage 7 is
-  while+scalar-write at parity with stage 4, so the same headroom
-  applies.
+The chunkie ptloop has four constructs that the current JIT bails on:
+
+1. **Struct array field access** (`T.nodes(inode).chld`, `T.nodes(inode).xi`)
+2. **Empty matrix init + vertical concat growth** (`it = []; it = [it; i]`)
+3. **Slice write with whole-tensor source** (`isp(1:nn) = itemp` where `itemp` is a Var, not a range slice)
+4. (perf only) **`and(...)`/`or(...)` function-call form in conditions** — lowers but ~3× slower than the operator form because it routes through the IBuiltin call path
+
+Plus everything from stages 1–8 is needed.
+
+The new stages decompose these capabilities one at a time:
+
+- **stage 09** — slice write with whole-tensor source. Smallest extension
+  to stage 6's `tryLowerRangeAssign`.
+- **stage 10** — fold `and()`/`or()` to JS `&&`/`||`. Pure perf
+  optimization; the JIT already lowers the function-call form via the
+  IBuiltin path.
+- **stage 11** — empty matrix literal + vertical concat growth. Needs a
+  new tensor-allocate-and-copy helper plus type unification across the
+  empty→non-empty transition.
+- **stage 12** — scalar struct field read (`s.f`). New JitType
+  representation for structs and a new `Member` lowering path.
+- **stage 13** — struct array indexing + chained `T.nodes(i).f`. Needs
+  a "row alias" analogous to stage 5's slice alias so the intermediate
+  Row struct is never materialized. This is the big one.
+- **stage 14** — full chunkie ptloop variant in struct-of-struct form,
+  combining 9–13 with everything from 1–8. Mirrors
+  `flagnear_rectangle.m` line-for-line. **Ambitious target #2.** When
+  this JITs cleanly, the actual chunkie source should JIT cleanly too.
+
+Each stage lands with:
+1. A correctness test in `numbl/numbl_test_scripts/indexing/` (or
+   `numbl_test_scripts/struct/` for stages 12–14) that uses the
+   `assert_jit_compiled()` marker to verify the surrounding loop body
+   actually JITs.
+2. A pass on the matching jit-benchmark stage script (the marker no
+   longer fires) plus a perf re-measurement.
+
+## The `assert_jit_compiled()` marker
+
+Tests and benchmark stages call this marker function inside the loop
+body they want to assert JIT compilation on:
+
+```matlab
+for i = 1:n
+    assert_jit_compiled();
+    % ... loop body with whatever capability is being staged ...
+end
+```
+
+Numbl-side mechanism:
+
+- **JIT lowering** (`jitLower.ts`): in `lowerStmt` case `ExprStmt`,
+  `ExprStmt(FuncCall("assert_jit_compiled", []))` is recognized and
+  lowered to the empty stmt list (no-op). In `lowerExpr` case
+  `FuncCall`, the same pattern in expression position lowers to a
+  literal `1`. Either way the call is elided when the surrounding loop
+  body lowers cleanly.
+- **Interpreter** (`interpreterSpecialBuiltins.ts`): registers
+  `assert_jit_compiled` as an interpreter special builtin (priority over
+  `.m` files). When called: if `optimization === 0` it silently no-ops
+  so `--opt 0` runs work; otherwise it throws a `RuntimeError`. Reaching
+  the interpreter means the JIT bailed.
+- **MATLAB shim** (`jit-benchmarks/stages/assert_jit_compiled.m`): a
+  silent no-op `function assert_jit_compiled() end`. Lets the same
+  script run unchanged in MATLAB. The runner adds `STAGES_DIR` to the
+  MATLAB path so the shim is found regardless of cwd.
+
+The runner detects the marker error via stderr matching and reports
+`BAIL` for that stage instead of crashing the whole sweep.
+
+## Other small follow-ups (deferred)
+
+- **stage 1–3 / 7 polish** — within ~5× of matlab. Stage 1 is at the
+  V8 ceiling for pure scalar arithmetic. Stages 2/3 have residual
+  headroom from inline-at-call-site tensor reads (~2× per the
+  standalone bisection notes). Stage 7 is while+scalar-write at parity
+  with stage 4, so the same headroom applies.
 - **multi-dim slice writes** — current stage 6 only handles linear
-  range writes (`dst(a:b) = src(c:d)`). Multi-dim shapes like
-  `dst(:, j) = src(:, k)` aren't yet supported. Not needed for the
-  chunkie ptloop (stage 8 only uses linear range), but useful for
-  other patterns.
-- **stepped ranges** — `setRange1r_h` assumes step=1. A stepped variant
-  would need a per-element loop in the helper rather than `Float64Array.set`.
-- **slice writes from a scalar fill** — `dst(a:b) = 5`. A different
-  helper (`fillRange1r_h`) and a different lowering path. Not needed
-  for the chunkie pattern.
-- **complex-tensor variants of all the above**.
-
-Each of these lands with a corresponding correctness test in
-`numbl/numbl_test_scripts/indexing/` plus a re-measurement of the
-matching jit-benchmark stage.
+  range writes. Multi-dim shapes like `dst(:, j) = src(:, k)` aren't
+  yet supported. Not needed for chunkie.
+- **stepped ranges** in slice writes (`dst(a:2:b)`).
+- **slice writes from a scalar fill** (`dst(a:b) = 5`).
+- **complex-tensor variants** of all the above.
 
 ## What was learned landing stage 6
 
@@ -416,10 +480,13 @@ same pattern comes up for stages 5-6:
 
 ## Current branch state (for resuming after compaction)
 
-- numbl: `main` at `fc76ddb` — stage 6 committed locally, **not pushed**.
-  Working tree clean.
-- numbl-chunkie-benchmark: `main` at `9e3a765` — stage 6 docs committed
-  locally, **not pushed**. Working tree clean.
+- numbl: stage 6 committed at `fc76ddb`, plus the stage 9–14 setup work
+  (`assert_jit_compiled` interpreter special builtin + JIT lowering
+  elision). Both committed locally, **not pushed**.
+- numbl-chunkie-benchmark: stage 6 docs at `9e3a765`/`6a4495b`, plus
+  the stage 9–14 setup work (assert_jit_compiled.m shim, six new
+  stage scripts, runner BAIL detection, README + PERF_NOTES updates).
+  Committed locally, **not pushed**.
 
 The numbl commits made so far for the loop JIT work, in order:
 - `34d107a` Fix --dump-js double-printing JIT compilations

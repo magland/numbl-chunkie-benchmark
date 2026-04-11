@@ -82,24 +82,42 @@ async function runStage(stageFile) {
   const stagePath = path.join(STAGES_DIR, stageFile);
   const stageName = path.basename(stageFile, '.m');
 
-  // MATLAB
-  const ml = await timed('matlab', ['-batch', `run('${stagePath}')`]);
+  // MATLAB — add the stages dir to the path so the assert_jit_compiled.m
+  // shim is found (MATLAB doesn't add the run() target's dir automatically).
+  const ml = await timed('matlab', [
+    '-batch',
+    `addpath('${STAGES_DIR}'); run('${stagePath}')`,
+  ]);
   const mlP = parse(ml.stdout);
 
-  // numbl with --dump-js
+  // numbl with --dump-js. We swallow non-zero exit codes here so that
+  // stages whose `assert_jit_compiled()` marker throws (because the
+  // surrounding loop hasn't been taught to JIT yet) get reported as
+  // BAIL rather than crashing the whole run.
   const tmpDir = await mkdtemp(path.join(tmpdir(), 'jitbench-'));
   const dumpFile = path.join(tmpDir, `${stageName}.js`);
   let nb, nbP, jit;
+  let bailReason = null;
   try {
-    nb = await timed('npx', [
-      'tsx',
-      NUMBL_CLI,
-      'run',
-      stagePath,
-      '--dump-js',
-      dumpFile,
-    ]);
-    nbP = parse(nb.stdout);
+    try {
+      nb = await timed('npx', [
+        'tsx',
+        NUMBL_CLI,
+        'run',
+        stagePath,
+        '--dump-js',
+        dumpFile,
+      ]);
+      nbP = parse(nb.stdout);
+    } catch (e) {
+      const out = (e.stdout ?? '') + (e.stderr ?? '');
+      if (out.includes('assert_jit_compiled:')) {
+        bailReason = 'marker (lowering bailed)';
+      } else {
+        bailReason = 'numbl error';
+      }
+      nbP = parse(out);
+    }
     jit = await readJitDump(dumpFile);
   } finally {
     await rm(tmpDir, { recursive: true, force: true });
@@ -138,6 +156,7 @@ async function runStage(stageFile) {
     jitEntries: jit.entries,
     mismatches,
     maxRel,
+    bailReason,
   };
 }
 
@@ -157,7 +176,13 @@ async function main() {
     try {
       const r = await runStage(s);
       results.push(r);
-      const status = r.mismatches > 0 ? 'CHECK_FAIL' : r.jitCount > 0 ? 'jit' : 'no-jit';
+      const status = r.bailReason
+        ? `BAIL (${r.bailReason})`
+        : r.mismatches > 0
+          ? 'CHECK_FAIL'
+          : r.jitCount > 0
+            ? 'jit'
+            : 'no-jit';
       process.stdout.write(
         `matlab=${fmtT(r.tMl)}  numbl=${fmtT(r.tNb)}  ratio=${r.ratio ? r.ratio.toFixed(2) + 'x' : '-'}  ${status}\n`
       );
@@ -181,7 +206,11 @@ async function main() {
           fmtT(r.tNb),
           r.ratio ? r.ratio.toFixed(2) + 'x' : '-',
           String(r.jitCount),
-          r.mismatches > 0 ? `**FAIL** (rel=${r.maxRel.toExponential(2)})` : 'ok',
+          r.bailReason
+            ? `**BAIL** (${r.bailReason})`
+            : r.mismatches > 0
+              ? `**FAIL** (rel=${r.maxRel.toExponential(2)})`
+              : 'ok',
         ].join(' | ') +
         ' |'
     );
