@@ -109,21 +109,21 @@ per-stage details and the V8 findings behind the improvements.
 | stage_06_slice_write          |  97ms | 6.653s |   34ms |  0.35x | jit |
 | stage_07_while_stack          |  36ms | 8.893s |   48ms |  1.32x | jit |
 | stage_08_full_bvh_query       | 101ms | 7.532s |   58ms |  0.57x | jit |
-| stage_09_slice_write_var_src  |  95ms |    —   |    —   |    —   | **BAIL** |
+| stage_09_slice_write_var_src  | 188ms |    —   |   53ms |  0.28x | jit |
 | stage_10_and_or_funccall      | 147ms |    —   |  438ms |  2.99x | jit (perf gap) |
 | stage_11_concat_growth        | 103ms |    —   |    —   |    —   | **BAIL** |
 | stage_12_struct_field_read    | 219ms |    —   |    —   |    —   | **BAIL** |
 | stage_13_struct_array_chained | 151ms |    —   |    —   |    —   | **BAIL** |
 | stage_14_chunkie_ptloop_struct| 132ms |    —   |    —   |    —   | **BAIL** |
 
-**Stages 1–8 are all JIT'ing.** Stages 4–6 and 8 beat matlab (ratio < 1×);
-stage 5 by ~4.5×. Stage 8, the flat-tensor BVH walker, runs ~1.7× faster
-than matlab.
+**Stages 1–9 are all JIT'ing.** Stages 4–6, 8, and 9 beat matlab
+(ratio < 1×); stages 5 and 9 by ~3.5×. Stage 8, the flat-tensor BVH
+walker, runs ~1.7× faster than matlab.
 
-**Stages 9–14 are the work-in-progress lineup** for getting the actual
-chunkie ptloop (struct-of-struct flavor) to JIT. Each one is currently
-failing the `assert_jit_compiled()` marker (or, for stage 10, lowering
-through a slow IBuiltin path). Once stages 9–13 land individually,
+**Stages 10–14 are the work-in-progress lineup** for getting the actual
+chunkie ptloop (struct-of-struct flavor) to JIT. Stages 11–14 currently
+fail the `assert_jit_compiled()` marker; stage 10 lowers but through a
+slow IBuiltin path (perf gap only). Once stages 10–13 land individually,
 stage 14 should JIT as a single loop function — and the chunkie
 `flagnear_rectangle.m` should follow.
 
@@ -139,7 +139,7 @@ Each stage corresponds to a specific gap in
 | 06 slice_write | Handle `Stmt: AssignLValue` whose lvalue is `Index` with a `Range` index. Codegen `$h.setRange1r_h(...)`. Also relax the codegen hoist pass to refresh hoisted aliases after every plain Assign to a hoisted tensor — required because the chunkie growth pattern reassigns the dst tensor inside the loop. | **done** |
 | 07 while_stack | No new lowering needed. | **done** (free after stage 4) |
 | 08 flat target | All of stages 04–07 must be in place. | **done** (entire flat-tensor BVH ptloop JITs as one loop) |
-| 09 slice_write_var_src | Extend `tryLowerRangeAssign` (or add a sibling) to accept an Ident or FuncCall RHS that resolves to a real-tensor variable. Emit a helper call that copies the entire source's data into the dst range with a runtime length check. | todo |
+| 09 slice_write_var_src | Extend `tryLowerRangeAssign` to accept a plain `Ident` RHS of a real tensor. IR change: `AssignIndexRange.srcStart`/`srcEnd` become nullable — when null the codegen substitutes `1` and the source's hoisted length alias. Same `setRange1r_h` helper handles both shapes; no new helper needed. | **done** |
 | 10 and_or_funccall | In `lowerExpr` case "FuncCall", recognize `and(a, b)` / `or(a, b)` (and possibly `not(a)`) with scalar args and synthesize a `Binary` JitExpr with `BinaryOperation.AndAnd` / `OrOr` instead of routing through the IBuiltin call path. **Perf optimization only — current path lowers but emits `$h.ib_and(...)` per iter.** | todo |
 | 11 concat_growth | Lower the empty matrix literal `[]` as a tensor `tensor[0x0]` and the vertical concat literal `[a; b]` (where `a` is a tensor and `b` is a scalar/tensor) into a helper that allocates a fresh tensor and copies. Type unification at the loop join must understand that `tensor[0x0]` widens to `tensor[?x1]` once concat fires. | todo |
 | 12 struct_field_read | Track struct types in the type env including their field types. Add a `tag: "MemberRead"` JitExpr (or extend Index) and lower scalar `s.f` reads as JS property loads. The struct must be created outside the loop (loop-invariant) so the field's runtime offset is stable. | todo |

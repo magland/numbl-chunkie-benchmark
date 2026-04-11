@@ -13,8 +13,8 @@
 %     resolves to one), and emit a helper call that copies the entire
 %     source into the dst range.
 
-npts  = 4000;
-nrect = 1000;
+npts  = 5000;
+nrect = 1500;
 
 ip = (1:npts);
 ir = (1:nrect);

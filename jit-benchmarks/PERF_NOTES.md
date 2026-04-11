@@ -259,26 +259,26 @@ inlining at the call site (which the user wants to avoid for codegen
 cleanness) or convincing V8 to bake the hoisted-rows constant. Not
 worth pursuing until stages 4-8 land.
 
-## What's next: stages 9–14 (struct-of-struct chunkie ptloop)
+## What's next: stages 10–14 (struct-of-struct chunkie ptloop)
 
-Stages 1–8 are done — the flat-tensor BVH walker (stage 8) JITs as a
-single loop and beats matlab. The new lineup, **stages 9–14**, pushes
+Stages 1–9 are done — the flat-tensor BVH walker (stage 8) JITs as a
+single loop and beats matlab, and stage 9 added the whole-tensor-RHS
+slice-write shape. The remaining lineup, **stages 10–14**, pushes
 toward making the actual chunkie `flagnear_rectangle.m` JIT cleanly
 without a flat-tensor refactor.
 
-The chunkie ptloop has four constructs that the current JIT bails on:
+The chunkie ptloop has three remaining constructs that the current JIT
+bails on (plus one perf gap):
 
-1. **Struct array field access** (`T.nodes(inode).chld`, `T.nodes(inode).xi`)
-2. **Empty matrix init + vertical concat growth** (`it = []; it = [it; i]`)
-3. **Slice write with whole-tensor source** (`isp(1:nn) = itemp` where `itemp` is a Var, not a range slice)
+1. **Empty matrix init + vertical concat growth** (`it = []; it = [it; i]`)
+2. **Struct array field access** (`T.nodes(inode).chld`, `T.nodes(inode).xi`)
+3. **Scalar struct field read** (`opts.k`, `chnkr.nch`)
 4. (perf only) **`and(...)`/`or(...)` function-call form in conditions** — lowers but ~3× slower than the operator form because it routes through the IBuiltin call path
 
-Plus everything from stages 1–8 is needed.
+Plus everything from stages 1–9 is needed.
 
 The new stages decompose these capabilities one at a time:
 
-- **stage 09** — slice write with whole-tensor source. Smallest extension
-  to stage 6's `tryLowerRangeAssign`.
 - **stage 10** — fold `and()`/`or()` to JS `&&`/`||`. Pure perf
   optimization; the JIT already lowers the function-call form via the
   IBuiltin path.
@@ -349,6 +349,36 @@ The runner detects the marker error via stderr matching and reports
 - **stepped ranges** in slice writes (`dst(a:2:b)`).
 - **slice writes from a scalar fill** (`dst(a:b) = 5`).
 - **complex-tensor variants** of all the above.
+
+## What was learned landing stage 9
+
+- **Stage 9 is the smallest extension to stage 6.** `tryLowerRangeAssign`
+  already had the shape `dst(a:b) = src(c:d)` via explicit-range RHS.
+  Stage 9 adds a third RHS branch for a plain `Ident` referencing a real
+  tensor. The only IR change is making `srcStart`/`srcEnd` nullable on
+  `AssignIndexRange`; codegen substitutes `1` and the source's hoisted
+  length alias when null. Same `setRange1r_h` helper — no new runtime
+  code. The `collectTensorUsage` walker needed a null-guard on the src
+  range visits and nothing else.
+- **The hoist refresh from stage 6 handles the `tmp_pt = out_pt` alias
+  dance for free.** When `tmp_pt = out_pt` runs, emitHoistRefresh reads
+  `tmp_pt.data` at a moment where `tmp_pt` and `out_pt` point to the
+  same tensor — so `$tmp_pt_data` captures the OLD buffer. Immediately
+  after, `out_pt = zeros(...)` reassigns `out_pt` and its own refresh
+  fires, updating `$out_pt_data` to the NEW buffer. The subsequent
+  `out_pt(1:nout_max) = tmp_pt` then copies from the captured OLD buffer
+  into the NEW buffer. No new codegen logic was needed — it's exactly
+  the shape stage 6's per-Assign refresh was designed to handle.
+- **`isWriteTarget` correctly distinguishes tmp_pt (read-only source)
+  from out_pt (write target).** `collectTensorUsage` bumps tmp_pt's
+  maxReadDim (from the AssignIndexRange src base) and leaves its
+  maxWriteDim at 0. So its refresh skips the `$h.unshare` call and only
+  reads `.data`/`.length`. This preserves the shared-reference invariant
+  on the old buffer.
+- **Stage 9 beat matlab by ~3.5×** (188ms → 53ms, ratio 0.28). Similar
+  to stage 5 (slice reads) in magnitude — both are dominated by the
+  scalar index ops in the inner loop after hoisting removes all per-iter
+  property loads.
 
 ## What was learned landing stage 6
 
@@ -480,13 +510,13 @@ same pattern comes up for stages 5-6:
 
 ## Current branch state (for resuming after compaction)
 
-- numbl: stage 6 committed at `fc76ddb`, plus the stage 9–14 setup work
-  (`assert_jit_compiled` interpreter special builtin + JIT lowering
-  elision). Both committed locally, **not pushed**.
-- numbl-chunkie-benchmark: stage 6 docs at `9e3a765`/`6a4495b`, plus
-  the stage 9–14 setup work (assert_jit_compiled.m shim, six new
-  stage scripts, runner BAIL detection, README + PERF_NOTES updates).
-  Committed locally, **not pushed**.
+- numbl: stages 1–9 landed. Stage 9 extends `tryLowerRangeAssign` for
+  whole-tensor RHS plus a numbl test at
+  `numbl_test_scripts/indexing/test_loop_slice_write_var_src.m`. All
+  commits local, **not pushed**.
+- numbl-chunkie-benchmark: stage 9 docs updated here and in the README.
+  Stages 10–14 still in the WIP lineup (10 lowers with perf gap;
+  11–14 BAIL).
 
 The numbl commits made so far for the loop JIT work, in order:
 - `34d107a` Fix --dump-js double-printing JIT compilations
