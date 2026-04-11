@@ -375,11 +375,10 @@ same pattern comes up for stages 5-6:
 
 ## Current branch state (for resuming after compaction)
 
-- numbl: `main` at `950d413` pre-stage-5; this session adds a stage-5
-  commit that lands slice-alias lowering and a new
-  `test_loop_slice_read.m` correctness test.
-- numbl-chunkie-benchmark: `main` at `be1ca40` pre-stage-5; this session
-  adds a stage-5 commit that updates PERF_NOTES.md and README.md.
+- numbl: `main` at `9318236` — stage 5 committed locally, **not pushed**.
+  Working tree clean.
+- numbl-chunkie-benchmark: `main` at `ff5fe2c` — stage 5 notes committed
+  locally, **not pushed**. Working tree clean.
 
 The numbl commits made so far for the loop JIT work, in order:
 - `34d107a` Fix --dump-js double-printing JIT compilations
@@ -394,7 +393,41 @@ The benchmark commits:
 - `52ffa21` Add jit-benchmarks suite for staged loop-JIT improvements
 - `a8f95d0` PERF_NOTES: add stage 4 implementation guide and branch state
 - `be1ca40` PERF_NOTES + README: stage 4 landed (scalar tensor write)
-- `(new)`   PERF_NOTES + README: stage 5 landed (slice reads)
+- `ff5fe2c` PERF_NOTES + README: stage 5 landed (slice reads)
+
+## State when paused for compaction
+
+Stage 5 is fully landed (implementation, test, benchmark update, PERF
+notes update, commits in both repos). **Nothing is pushed yet.**
+
+Immediately before compaction the plan was to start **stage 6: slice
+writes**. Notes on the stage 6 design decision in case it's the same
+when resuming:
+
+- The chunkie pattern that matters is `out(1:nout) = src(1:nout)` — a
+  range-slice write from a range-slice read of another tensor, both
+  with the same length. This is what stage 8's grow-and-copy path
+  uses, and it's the only slice-write shape stage 6's benchmark
+  exercises. See `stages/stage_06_slice_write.m`.
+- The natural implementation approach is the mirror of stage 5's
+  slice-read: a new `$h.setSliceRange_h(dstData, dstLen, dstStart,
+  dstEnd, srcData, srcLen, srcStart, srcEnd)` helper that does a
+  bounds-checked `Float64Array.set(src.subarray(...), dstStart-1)`.
+  Unlike slice reads, slice writes DO need codegen (a new IR node or
+  an extension of `AssignIndex` to carry ranges).
+- `Expr: Range` lowering is already needed for the indices of both the
+  LHS and the RHS. It doesn't need a full JitExpr-producing form —
+  only a "range slot" that can sit inside an `Index` lvalue/rvalue.
+  A minimal shape would be `{ tag: "RangeSlot"; start: JitExpr; end:
+  JitExpr; step: JitExpr | null }` that's only allowed as an index
+  argument.
+- The write-target must be a real tensor already in the hoist-unshare
+  path (stage 4 work), so the helper can go directly through
+  `<dst>_data` without needing per-write unshare.
+- Correctness test should cover (a) same-length range copy, (b) copy
+  from a subrange of a different tensor, (c) interaction with scalar
+  writes to the same tensor (the unshare-once-at-entry strategy must
+  still work).
 
 ## Cheat sheet for the next session
 
