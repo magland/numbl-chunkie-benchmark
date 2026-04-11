@@ -510,13 +510,117 @@ same pattern comes up for stages 5-6:
 
 ## Current branch state (for resuming after compaction)
 
-- numbl: stages 1–9 landed. Stage 9 extends `tryLowerRangeAssign` for
-  whole-tensor RHS plus a numbl test at
-  `numbl_test_scripts/indexing/test_loop_slice_write_var_src.m`. All
-  commits local, **not pushed**.
-- numbl-chunkie-benchmark: stage 9 docs updated here and in the README.
-  Stages 10–14 still in the WIP lineup (10 lowers with perf gap;
-  11–14 BAIL).
+- numbl: stages 1–9 landed. Stage 9 at `c63e4f5`
+  ("JIT: range-slice write with whole-tensor source (stage 9)"). The
+  numbl test is `numbl_test_scripts/indexing/test_loop_slice_write_var_src.m`.
+  All commits local, **not pushed**.
+- numbl-chunkie-benchmark: stage 9 docs at `5de6f42`. Stages 10–14
+  still in the WIP lineup (10 lowers with perf gap; 11–14 BAIL).
+
+### Next: stage 10 implementation sketch
+
+Stage 10 is the smallest of the remaining stages — pure perf, no
+correctness gap. The `and(a,b)` / `or(a,b)` / `not(a)` function-call
+forms already lower through the IBuiltin path
+(`$h.ib_and(...)` / `ib_or(...)` / `ib_not(...)`). Current stage 10
+ratio is 2.92× matlab (170ms → 497ms) because those helpers go
+through the general Var-dispatch path instead of folding to JS `&&`
+/`||`/`!`.
+
+Fix: in `lowerExpr` case `"FuncCall"` in
+[jitLower.ts:1260](../../numbl/src/numbl-core/interpreter/jit/jitLower.ts#L1260),
+immediately after the `assert_jit_compiled` elision (~line 1275) and
+before the `varType = ctx.env.get(expr.name)` lookup, recognize the
+three names when **not** shadowed by a local and when args are scalar:
+
+```ts
+if (
+  !ctx.env.has(expr.name) &&
+  (expr.name === "and" || expr.name === "or") &&
+  expr.args.length === 2
+) {
+  const left = lowerExpr(ctx, expr.args[0]);
+  if (!left) return null;
+  const right = lowerExpr(ctx, expr.args[1]);
+  if (!right) return null;
+  if (!isScalarType(left.jitType) || !isScalarType(right.jitType)) {
+    // tensor args: fall through to the IBuiltin path
+  } else {
+    const op = expr.name === "and"
+      ? BinaryOperation.AndAnd : BinaryOperation.OrOr;
+    return {
+      tag: "Binary", op, left, right,
+      jitType: { kind: "boolean" },
+    };
+  }
+}
+if (
+  !ctx.env.has(expr.name) &&
+  expr.name === "not" &&
+  expr.args.length === 1
+) {
+  const operand = lowerExpr(ctx, expr.args[0]);
+  if (!operand) return null;
+  if (isScalarType(operand.jitType)) {
+    return {
+      tag: "Unary", op: UnaryOperation.Not, operand,
+      jitType: { kind: "boolean" },
+    };
+  }
+}
+```
+
+`isScalarType` helper is already used elsewhere in the file. Both
+`BinaryOperation` and `UnaryOperation` are already imported from
+`../../parser/types.js` at the top of the file (line 9).
+
+**Why this is safe**: (a) MATLAB's `and`/`or`/`not` builtins short-
+circuit when given scalars (same as `&&`/`||`/`~`), so semantics
+match. (b) Shadowing check via `ctx.env.has(expr.name)` prevents
+hijacking a user-local named `and`. (c) Tensor args fall through to
+the IBuiltin path unchanged so elementwise behavior is preserved.
+
+**Test**: add
+`numbl_test_scripts/expressions/test_loop_and_or_not_func_form.m` (or
+similar) with `assert_jit_compiled()` inside a loop and several
+and/or/not patterns. Verify results match the operator form.
+
+**Benchmark expectation**: stage_10 ratio should drop from 2.92× to
+~1× (or below) once folding fires. The generated JS should no longer
+contain `$h.ib_and` / `$h.ib_or` / `$h.ib_not` calls in the dumped
+loop body.
+
+### Stages 11-14 gotchas (for planning ahead)
+
+- **Stage 11 (concat growth)**: Empty matrix literal `[]` has no
+  dimensions at lowering time. The shape tracker must widen
+  `tensor[0x0]` to `tensor[?x1]` at the first non-empty concat. The
+  fixed-point iterator in `lowerFor` drives this. New helper
+  `$h.vconcat_grow(t, v)` allocates a fresh `(k+1, 1)` tensor and
+  copies. Per-iter allocation is unavoidable for the growth semantics,
+  but V8's allocator is fast; expect ~2× slower than the flat version
+  but still well under matlab.
+
+- **Stage 12 (struct field read)**: New `JitType.kind = "struct"` with
+  a `fields: Record<string, JitType>` map. `lowerExpr` case `Member`
+  becomes a new `MemberRead` JitExpr that codegens to a JS property
+  load. The struct must be loop-invariant (created outside) so the
+  field offset is stable. Small test: `opts.k`, `opts.tol`, etc.
+
+- **Stage 13 (struct array chained)**: This is the big one. Need a
+  new `struct_array` JitType. Lower `T.nodes(inode)` as a "row alias"
+  analogous to slice aliases: no Row struct materialization. Chained
+  `Member(Index(Member(T, nodes), [i]), chld)` substitutes through to
+  a direct field-storage read at the leaf. The question is how
+  numbl's runtime stores struct arrays — likely as a per-field typed
+  storage, in which case the read collapses to
+  `T_nodes_chld.get(inode - 1)`. Check the runtime implementation
+  before designing the JitType.
+
+- **Stage 14 (full struct ptloop)**: Combines 9–13 on top of 1–8. No
+  new capability, just the integration test. If 9–13 all land
+  cleanly, stage 14 should JIT as one loop function — the same thing
+  that happened going from stages 1–7 to stage 8.
 
 The numbl commits made so far for the loop JIT work, in order:
 - `34d107a` Fix --dump-js double-printing JIT compilations
