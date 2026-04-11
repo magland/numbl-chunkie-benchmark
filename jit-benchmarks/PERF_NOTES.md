@@ -211,34 +211,43 @@ In commit order:
 | `db20187` JIT: specialized fast helpers for real-tensor scalar reads | Add `idx1r/idx2r/idx3r` helpers with `\| 0` index conversion, no `isTensor` check, no `imag` check, no per-call array allocation. Codegen emits these when the call site can prove the base is a real tensor. | stage 02: 1.31s → 670ms (1.93x). stage 03: 933ms → 670ms (1.39x). |
 | `1a30b64` JIT: build per-runtime helpers via spread for stable hidden class | `buildPerRuntimeJitHelpers` now constructs the result via a single spread literal `{ ...jitHelpers, ... }` so V8 sees a fresh hidden class. `jitLoop.ts` was also passing the global `jitHelpers` instead of `rt.jitHelpers` — fixed to match what `jit/index.ts` already did for function-level JIT. | stage 02: 670ms → 227ms (2.95x). stage 03: 670ms → 241ms (2.78x). |
 | `d6f7ea6` JIT: hoist tensor base reads, clean conditionals, prune dead loop outputs | (1) Add `idx{1,2,3}r_h` helpers taking pre-extracted (data, len, dim sizes) args, and hoist per-tensor reads to local aliases at function entry. (2) Recursively emit JS-boolean form inside conditions in `emitTruthiness`. (3) Filter the loop output set with sibling-tail liveness via new `collectReadsFromSiblings` + `_postSiblings` plumbing. | stage 02: 227ms → 194ms (1.17x). stage 03: 241ms → 98ms (2.46x). |
-| _stage-4_ JIT: scalar tensor write via hoisted `unshare` | (1) New `set{1,2,3}r_h` helpers mirroring `idx{1,2,3}r_h`. (2) New `unshare(t)` helper that returns `t` if `_rc <= 1` else a fresh copy. (3) New `AssignIndex` JIT IR node. (4) `lowerAssignLValue` handles `t(i)=v` with 1-3 scalar indices on real tensors. (5) Codegen's hoist pass was loosened so write-target tensor params go through `unshare` once at function entry and then hoist data/len/shape like the read-only case. | stage 04: 4188ms → 31ms (**135×**, ratio 0.98× matlab). stage 07: 8893ms → 44ms (**202×**, ratio 1.20× matlab — it auto-JIT'd because while-stack only needed scalar push/pop). |
+| `cb2eb8b` JIT: scalar tensor write via hoisted `unshare` | (1) New `set{1,2,3}r_h` helpers mirroring `idx{1,2,3}r_h`. (2) New `unshare(t)` helper that returns `t` if `_rc <= 1` else a fresh copy. (3) New `AssignIndex` JIT IR node. (4) `lowerAssignLValue` handles `t(i)=v` with 1-3 scalar indices on real tensors. (5) Codegen's hoist pass was loosened so write-target tensor params go through `unshare` once at function entry and then hoist data/len/shape like the read-only case. | stage 04: 4188ms → 31ms (**135×**, ratio 0.98× matlab). stage 07: 8893ms → 44ms (**202×**, ratio 1.20× matlab — it auto-JIT'd because while-stack only needed scalar push/pop). |
+| _stage-5_ JIT: colon-slice reads via "slice alias" substitution | (1) New `SliceAlias` type in lowerCtx: a map from MATLAB local → `{ baseName, template, sliceShape }` where `template` is per-dim `{kind: "colon"} \| {kind: "expr", expr}`. No RuntimeTensor is materialized for the slice. (2) `tryLowerAsSliceBind` recognizes `name = base(:, i, ...)` (both Index and FuncCall forms — the parser produces FuncCall when it can't disambiguate), captures each non-literal scalar index into a tmp local to freeze bind-time values (MATLAB semantics), and emits the tmp Assigns only. (3) Index reads of aliased names substitute back into a direct scalar read on the base tensor, which flows through the existing hoisted `idx{1,2,3}r_h` fast path. (4) Slice aliases are lexically scoped — snapshot/restore in lowerFor/While/If so aliases don't leak across branches or past loop exits. (5) Codegen needed zero changes: slice-bind emits plain Assigns and slice-reads emit plain Index JitExprs. | stage 05: **6552ms → 22ms (~300×, ratio 0.25× matlab — 4× faster than matlab)**. Stage 08 outer driver still bails (needs slice writes), but its sub-loops that are pure scalar-in-body now lower cleanly. |
 
 ## Cumulative results vs. the original baseline
 
-Before any work this session vs. after the stage-4 work. matlab numbers
+Before any work this session vs. after the stage-5 work. matlab numbers
 are run-to-run noise (~10% spread).
 
 | stage | matlab | numbl before | numbl after | speedup | ratio (nb/ml) |
 |---|---|---|---|---|---|
-| stage_01_scalar_arith | ~58ms | ~320ms | ~293ms | 1.09× | 5.06× |
-| stage_02_scalar_tensor_reads | ~76ms | ~1311ms | ~198ms | **6.62×** | 2.61× |
-| stage_03_nested_with_compare | ~47ms | ~933ms | ~99ms | **9.42×** | 2.11× |
-| stage_04_scalar_write | ~32ms | ~4188ms | **~31ms** | **135×** | **0.98×** |
-| stage_05_slice_read | ~95ms | ~6509ms | (still no JIT — bails on `t(:,i)`) | — | — |
-| stage_06_slice_write | ~93ms | ~6881ms | (still no JIT — bails on `t(a:b)=v`) | — | — |
-| stage_07_while_stack | ~37ms | ~8893ms | **~44ms** | **202×** | **1.20×** |
-| stage_08_full_bvh_query | ~100ms | ~7532ms | (2 sub-loops JIT, outer bails on slice read) | — | — |
+| stage_01_scalar_arith | ~58ms | ~320ms | ~286ms | 1.12× | 4.94× |
+| stage_02_scalar_tensor_reads | ~72ms | ~1311ms | ~195ms | **6.72×** | 2.71× |
+| stage_03_nested_with_compare | ~54ms | ~933ms | ~105ms | **8.89×** | 1.94× |
+| stage_04_scalar_write | ~25ms | ~4188ms | **~29ms** | **144×** | **1.17×** |
+| stage_05_slice_read | ~92ms | ~6509ms | **~24ms** | **271×** | **0.26×** |
+| stage_06_slice_write | ~97ms | ~6881ms | (still no JIT — bails on `t(a:b)=v`) | — | — |
+| stage_07_while_stack | ~32ms | ~8893ms | **~43ms** | **207×** | **1.33×** |
+| stage_08_full_bvh_query | ~101ms | ~7532ms | (2 sub-loops JIT, outer bails on slice write) | — | — |
 
-**Stage 7 was a free win.** It uses the while-loop push/pop pattern on
-an integer stack tensor, which only needs scalar indexed read and
-scalar indexed write — both of which stage 4 enables. No stage-7-specific
-changes were needed; it auto-JIT'd as soon as scalar writes landed.
+**Stage 5 is the current record: 0.26× matlab (4× faster).** The slice-alias
+approach turns `pt = pts(:, i); pxi = pt(1); pyi = pt(2)` into two
+direct hoisted scalar reads on `pts`, with zero runtime allocation. V8
+then hits the same fast path that stages 2–3 converged on, and closes
+the matlab gap entirely.
 
-**Stage 8 is now partially JIT'd.** Two of its inner sub-loops (the
-BVH-walk sibling loops at line 81) compile cleanly now that scalar
-writes work. The outer driver loop still bails because the BVH query
-uses slice reads (`pt = pts(:, i)`) to extract each query point. Once
-stages 5-6 land, stage 8 should collapse as well.
+**Stage 7 was a free win from stage 4.** It uses the while-loop push/pop
+pattern on an integer stack tensor, which only needs scalar indexed
+read and scalar indexed write — both of which stage 4 enables. No
+stage-7-specific changes were needed; it auto-JIT'd as soon as scalar
+writes landed.
+
+**Stage 8 is still only partially JIT'd.** Two of its inner sub-loops
+(the BVH-walk sibling-traversal loops) compile cleanly and the outer
+driver now slices cleanly too via stage 5, but the outer driver still
+bails because the grow-and-copy path uses slice-write (`out_pt(1:nout_max)
+= tmp_pt(1:nout_max)`). Once stage 6 lands, stage 8 should collapse as
+well.
 
 **Stage 1 is at the V8 ceiling.** Verified by hand-writing the exact
 generated JS and timing it under bare `node`: pure JS = 342ms, our JIT
@@ -252,21 +261,71 @@ inlining at the call site (which the user wants to avoid for codegen
 cleanness) or convincing V8 to bake the hoisted-rows constant. Not
 worth pursuing until stages 4-8 land.
 
-## What's next: stages 5, 6, 8 (JIT coverage)
+## What's next: stages 6, 8 (JIT coverage)
 
-Stages 4 and 7 are done. What's left:
+Stages 4, 5, and 7 are done. What's left:
 
-- **stage 5** — `Expr: Colon` and `Expr: Range`, plus `Index` with
-  mixed scalar+colon/range indices producing a small tensor. Codegen
-  needs slice-read helpers (`slice2r_h(data, ..., kind)` or similar).
-- **stage 6** — `AssignLValue: Index(range...)`. Slice-write helper.
-- **stage 8** — combines all of stages 4-7 in the BVH walker. The
-  two sub-loops already JIT; the outer driver bails on slice reads.
-  Should JIT cleanly once 5-6 land.
+- **stage 6** — `AssignLValue: Index(range...)`. Slice-write helper
+  like `setSlice1r_h(dst, srcData, srcOff, len, dstStart)`. The
+  obvious implementation path is a range-range copy (`Float64Array.set`
+  with a subarray view), but the common chunkie pattern is `isp(1:nn) =
+  itemp` with a range-range where the src is another tensor, not a
+  range expression. Handle at least:
+  * `dst(a:b) = src(a:b)` (range slice write from a range slice read)
+  * `dst(:, i) = src(:, j)` (column-colon write from column-colon read
+    — same shape)
+  For now, skip the `Expr: Range` form entirely except as the inside of
+  an `Index` — range expressions as first-class tensor values are out of scope.
+- **stage 8** — combines stages 4-7 in the BVH walker. The two sub-loops
+  already JIT and the query's outer slice read (`pt = pts(:, i)`) now
+  works via stage 5. The outer driver still bails on the grow-and-copy
+  slice-write path (`out_pt(1:nout_max) = tmp_pt(1:nout_max)`), which
+  is the core of what stage 6 must add. Should JIT cleanly once stage 6
+  lands.
 
 Each of these lands with a corresponding correctness test in
 `numbl/numbl_test_scripts/indexing/` plus a re-measurement of the
 matching jit-benchmark stage.
+
+## What was learned landing stage 5
+
+- **Slice-alias substitution beats materialization.** The original plan
+  was to lower `pt = pts(:, i)` as a helper call producing a small
+  RuntimeTensor (`$h.slice2(pts, ":", i)`) and then do scalar reads on
+  that tensor. That would work but pay an allocation + a tensor object
+  property load per access. Substitution has zero per-iter cost — it
+  produces exactly the same JS as if the user had hand-written
+  `pts(1, i)` directly.
+- **The parser produces FuncCall, not Index, for RHS `t(...)`.**
+  When `t` is a variable the parser can't always tell; for the LHS of an
+  AssignLValue it commits to Index, but for an expression RHS it
+  typically produces FuncCall. `tryLowerAsSliceBind` accepts both shapes
+  and normalizes. This caught me out — my first run dumped zero JIT for
+  stage 5 because I was only matching `Index`. Debug trick: throwing a
+  quick `parseMFile` test into `/tmp` with a heredoc and dumping
+  `mainBody` is fastest way to see what form the parser uses.
+- **Tmp capture for non-literal indices is cheap but necessary.** The
+  MATLAB semantic is that `pt = pts(:, i)` freezes the value of `i` at
+  the bind site, so later reassignments of `i` don't affect later
+  `pt(k)` reads. The substitution form needs to preserve that. Every
+  non-literal scalar index gets captured into a `_slice_<name>_d<dim>`
+  local at the bind site, and the template references the captured
+  local. For a typical pattern where the scalar index is just the loop
+  variable, this is a trivial `_slice_pt_d1 = i` that V8 inlines away.
+- **Slice aliases need to be lexically scoped.** Without a
+  snapshot/restore in lowerFor/lowerWhile/lowerIf, an alias created
+  inside one branch of an `if` would leak to post-if code and produce
+  wrong codegen when the branch didn't actually execute. The snapshot
+  discipline follows the existing `envBefore` pattern so it's trivial
+  to keep right.
+- **The existing output-set liveness filter handles slice aliases
+  correctly.** Slice-aliased names get "assigned" in the pre-lowering
+  analyzer, but the liveOut filter removes them if they're not read
+  post-loop. Since the lowering itself doesn't add the name to
+  `assignedVars` (only its `_slice_` slots do), the check at the end of
+  `lowerFunction` passes naturally when the alias is purely loop-local
+  and bails cleanly when the alias name escapes the loop (requiring
+  materialization we don't do).
 
 ## Dead code removed
 
@@ -287,7 +346,7 @@ loop JIT at all. With the removal:
   dumps the JIT function list per stage and compares numbl vs.
   MATLAB output on every run.
 
-## What was learned landing stage 4
+## What was learned landing stage 4 (earlier session)
 
 The design went exactly as `git log -p` shows. A few notes in case the
 same pattern comes up for stages 5-6:
@@ -316,9 +375,11 @@ same pattern comes up for stages 5-6:
 
 ## Current branch state (for resuming after compaction)
 
-- numbl: `main` at `950d413`, pushed. Working tree clean.
-- numbl-chunkie-benchmark: `main` at `a8f95d0` pre-update; this commit
-  updates PERF_NOTES.md and README.md with the stage-4 results.
+- numbl: `main` at `950d413` pre-stage-5; this session adds a stage-5
+  commit that lands slice-alias lowering and a new
+  `test_loop_slice_read.m` correctness test.
+- numbl-chunkie-benchmark: `main` at `be1ca40` pre-stage-5; this session
+  adds a stage-5 commit that updates PERF_NOTES.md and README.md.
 
 The numbl commits made so far for the loop JIT work, in order:
 - `34d107a` Fix --dump-js double-printing JIT compilations
@@ -327,10 +388,13 @@ The numbl commits made so far for the loop JIT work, in order:
 - `d6f7ea6` JIT: hoist tensor base reads, clean conditionals, prune dead loop outputs
 - `cb2eb8b` JIT: scalar tensor write via hoisted unshare (**stage 4**)
 - `950d413` Remove obsolete numbl_test_scripts/jit/ and %!jit annotation matcher
+- `9318236` JIT: slice reads via alias substitution (**stage 5**)
 
 The benchmark commits:
 - `52ffa21` Add jit-benchmarks suite for staged loop-JIT improvements
 - `a8f95d0` PERF_NOTES: add stage 4 implementation guide and branch state
+- `be1ca40` PERF_NOTES + README: stage 4 landed (scalar tensor write)
+- `(new)`   PERF_NOTES + README: stage 5 landed (slice reads)
 
 ## Cheat sheet for the next session
 

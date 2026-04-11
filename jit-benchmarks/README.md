@@ -67,17 +67,19 @@ per-stage details and the V8 findings behind the improvements.
 
 | stage | matlab | numbl (initial) | numbl (current) | current ratio | jit fires? |
 | --- | --- | --- | --- | --- | --- |
-| stage_01_scalar_arith        |  58ms |  320ms |  293ms |  5.06x | yes |
-| stage_02_scalar_tensor_reads |  76ms | 1.311s |  198ms |  2.61x | yes |
-| stage_03_nested_with_compare |  47ms |  933ms |   99ms |  2.11x | yes |
-| stage_04_scalar_write        |  32ms | 4.188s |   31ms |  0.98x | yes |
-| stage_05_slice_read          |  95ms | 6.509s | 6.552s | 68.79x | **no** |
-| stage_06_slice_write         |  93ms | 6.653s | 6.881s | 74.13x | **no** |
-| stage_07_while_stack         |  37ms | 8.893s |   44ms |  1.20x | yes |
-| stage_08_full_bvh_query      | 100ms | 7.532s | 7.840s | 78.54x | outer loop no |
+| stage_01_scalar_arith        |  58ms |  320ms |  286ms |  4.94x | yes |
+| stage_02_scalar_tensor_reads |  72ms | 1.311s |  195ms |  2.71x | yes |
+| stage_03_nested_with_compare |  54ms |  933ms |  105ms |  1.94x | yes |
+| stage_04_scalar_write        |  25ms | 4.188s |   29ms |  1.17x | yes |
+| stage_05_slice_read          |  92ms | 6.509s |   24ms |  0.26x | yes |
+| stage_06_slice_write         |  97ms | 6.653s | 7.176s | 73.73x | **no** |
+| stage_07_while_stack         |  32ms | 8.893s |   43ms |  1.33x | yes |
+| stage_08_full_bvh_query      | 101ms | 7.532s | 7.679s | 76.09x | sub-loops yes, outer no |
 
-Stages 4 and 7 are within 20% of matlab; stage 4 actually beats it.
-Stages 5, 6, 8 still need the slice read / slice write JIT support.
+Stages 4, 5, and 7 are all within 35% of matlab; stage 5 actually
+**beats matlab by ~4×** (slice reads substitute directly into scalar reads
+on the base tensor — no per-iter allocation, V8 hits the same fast path
+as stages 2-3). Stages 6 and 8 still need slice-write JIT support.
 
 ## Capability staging plan (numbl side)
 
@@ -87,10 +89,10 @@ Each stage corresponds to a specific gap in
 | Stage | Required jitLower change | Status |
 |---|---|---|
 | 04 scalar_write | Handle `Stmt: AssignLValue` whose lvalue is `Index` with **scalar** indices on a tensor base. Codegen `$h.set1r_h(...)` etc. | **done** |
-| 05 slice_read | Handle `Expr: Colon` and `Expr: Range`. Allow `Index` with mixed scalar + colon/range indices. Result type is a small tensor with shape inferred from base shape. Codegen `$h.slice2(t, ":", i)` etc. | todo |
+| 05 slice_read | Handle `Expr: Colon` inside an `Index`/`FuncCall` base. Implemented as a "slice alias": `pt = pts(:, i)` doesn't allocate anything — it's recorded as a substitution rule, and subsequent reads `pt(k)` rewrite into direct scalar reads on the source tensor. No codegen changes needed. | **done** |
 | 06 slice_write | Handle `Stmt: AssignLValue` whose lvalue is `Index` with at least one `Range`/`Colon`. Codegen `$h.setSlice(...)`. | todo |
 | 07 while_stack | No new lowering needed. | **done** (free after stage 4) |
-| 08 full target | All of the above must be in place. Stage 8 should JIT cleanly once stages 5-6 land. | partial (sub-loops JIT) |
+| 08 full target | All of the above must be in place. | sub-loops JIT; outer bails on slice write |
 
 Each capability lands in numbl together with a correctness test in
 `~/src/numbl/numbl_test_scripts/indexing/` (or similar). After landing
