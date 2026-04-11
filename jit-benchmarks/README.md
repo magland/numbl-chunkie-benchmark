@@ -60,47 +60,41 @@ timings, ratios, JIT-fired count and check status.
 | 07 while_stack | while loop driving an integer stack stored in a tensor | the BVH walk `while(is > 0, ...)` push/pop |
 | 08 **full_bvh_query** | combines stages 4–7 in a stack-driven BVH traversal with hit accumulation and slice-write growth | the entire ptloop |
 
-## Baseline (before JIT additions)
+## Progress
 
-Last measured 2026-04-11 on the dev machine. `ratio` is `numbl / matlab`.
+`ratio` is `numbl / matlab`. See [PERF_NOTES.md](PERF_NOTES.md) for
+per-stage details and the V8 findings behind the improvements.
 
-| stage | matlab | numbl | ratio | jit fired |
-| --- | --- | --- | --- | --- |
-| stage_01_scalar_arith        |  54ms |  320ms |   5.91x | yes |
-| stage_02_scalar_tensor_reads |  68ms | 1.267s |  18.74x | yes |
-| stage_03_nested_with_compare |  45ms |  933ms |  20.75x | yes |
-| stage_04_scalar_write        |  29ms | 4.188s | 146.67x | **no** |
-| stage_05_slice_read          |  95ms | 6.509s |  68.63x | **no** |
-| stage_06_slice_write         |  91ms | 6.653s |  72.83x | **no** |
-| stage_07_while_stack         |  35ms | 8.893s | 255.17x | **no** |
-| stage_08_full_bvh_query      |  98ms | 7.532s |  77.24x | **no** |
+| stage | matlab | numbl (initial) | numbl (current) | current ratio | jit fires? |
+| --- | --- | --- | --- | --- | --- |
+| stage_01_scalar_arith        |  58ms |  320ms |  293ms |  5.06x | yes |
+| stage_02_scalar_tensor_reads |  76ms | 1.311s |  198ms |  2.61x | yes |
+| stage_03_nested_with_compare |  47ms |  933ms |   99ms |  2.11x | yes |
+| stage_04_scalar_write        |  32ms | 4.188s |   31ms |  0.98x | yes |
+| stage_05_slice_read          |  95ms | 6.509s | 6.552s | 68.79x | **no** |
+| stage_06_slice_write         |  93ms | 6.653s | 6.881s | 74.13x | **no** |
+| stage_07_while_stack         |  37ms | 8.893s |   44ms |  1.20x | yes |
+| stage_08_full_bvh_query      | 100ms | 7.532s | 7.840s | 78.54x | outer loop no |
 
-Two takeaways:
-
-1. **Stage 4 is the cliff.** The moment we introduce `t(i) = v`, the
-   loop fails JIT lowering and falls all the way back to the
-   AST-walking interpreter. Per-element cost jumps roughly 20× → 150×.
-2. **Stages 1–3 already JIT, but are still 6–20× slower than MATLAB.**
-   Even when JIT works, the generated JS has overhead that MATLAB's JIT
-   doesn't pay. There's headroom on the JIT *codegen quality* angle
-   too, separate from the *coverage* angle that stages 4–8 target.
+Stages 4 and 7 are within 20% of matlab; stage 4 actually beats it.
+Stages 5, 6, 8 still need the slice read / slice write JIT support.
 
 ## Capability staging plan (numbl side)
 
 Each stage corresponds to a specific gap in
 `numbl/src/numbl-core/interpreter/jit/jitLower.ts`:
 
-| Stage | Required jitLower change |
-|---|---|
-| 04 scalar_write | Handle `Stmt: AssignLValue` whose lvalue is `Index` with **scalar** indices on a tensor base. Codegen `$h.set1(t, i, v)` / `$h.set2(t, r, c, v)` helpers. |
-| 05 slice_read | Handle `Expr: Colon` and `Expr: Range`. Allow `Index` with mixed scalar + colon/range indices. Result type is a small tensor with shape inferred from base shape. Codegen `$h.slice2(t, ":", i)` etc. |
-| 06 slice_write | Handle `Stmt: AssignLValue` whose lvalue is `Index` with at least one `Range`/`Colon`. Codegen `$h.setSlice(...)`. |
-| 07 while_stack | No new lowering — but stages 04 and 05 must already work, since the stack uses scalar push/pop on a tensor. |
-| 08 full target | All of the above must be in place. Stage 8 should JIT cleanly once stages 4–7 do. |
+| Stage | Required jitLower change | Status |
+|---|---|---|
+| 04 scalar_write | Handle `Stmt: AssignLValue` whose lvalue is `Index` with **scalar** indices on a tensor base. Codegen `$h.set1r_h(...)` etc. | **done** |
+| 05 slice_read | Handle `Expr: Colon` and `Expr: Range`. Allow `Index` with mixed scalar + colon/range indices. Result type is a small tensor with shape inferred from base shape. Codegen `$h.slice2(t, ":", i)` etc. | todo |
+| 06 slice_write | Handle `Stmt: AssignLValue` whose lvalue is `Index` with at least one `Range`/`Colon`. Codegen `$h.setSlice(...)`. | todo |
+| 07 while_stack | No new lowering needed. | **done** (free after stage 4) |
+| 08 full target | All of the above must be in place. Stage 8 should JIT cleanly once stages 5-6 land. | partial (sub-loops JIT) |
 
-Each capability lands in numbl together with a corresponding test in
-`~/src/numbl/numbl_test_scripts/jit/`. After landing each, re-run the
-matching stage and confirm the ratio collapses.
+Each capability lands in numbl together with a correctness test in
+`~/src/numbl/numbl_test_scripts/indexing/` (or similar). After landing
+each, re-run the matching stage and confirm the ratio collapses.
 
 ## Out of scope (for this benchmark)
 

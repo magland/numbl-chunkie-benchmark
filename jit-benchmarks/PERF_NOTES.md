@@ -211,22 +211,34 @@ In commit order:
 | `db20187` JIT: specialized fast helpers for real-tensor scalar reads | Add `idx1r/idx2r/idx3r` helpers with `\| 0` index conversion, no `isTensor` check, no `imag` check, no per-call array allocation. Codegen emits these when the call site can prove the base is a real tensor. | stage 02: 1.31s → 670ms (1.93x). stage 03: 933ms → 670ms (1.39x). |
 | `1a30b64` JIT: build per-runtime helpers via spread for stable hidden class | `buildPerRuntimeJitHelpers` now constructs the result via a single spread literal `{ ...jitHelpers, ... }` so V8 sees a fresh hidden class. `jitLoop.ts` was also passing the global `jitHelpers` instead of `rt.jitHelpers` — fixed to match what `jit/index.ts` already did for function-level JIT. | stage 02: 670ms → 227ms (2.95x). stage 03: 670ms → 241ms (2.78x). |
 | `d6f7ea6` JIT: hoist tensor base reads, clean conditionals, prune dead loop outputs | (1) Add `idx{1,2,3}r_h` helpers taking pre-extracted (data, len, dim sizes) args, and hoist per-tensor reads to local aliases at function entry. (2) Recursively emit JS-boolean form inside conditions in `emitTruthiness`. (3) Filter the loop output set with sibling-tail liveness via new `collectReadsFromSiblings` + `_postSiblings` plumbing. | stage 02: 227ms → 194ms (1.17x). stage 03: 241ms → 98ms (2.46x). |
+| _stage-4_ JIT: scalar tensor write via hoisted `unshare` | (1) New `set{1,2,3}r_h` helpers mirroring `idx{1,2,3}r_h`. (2) New `unshare(t)` helper that returns `t` if `_rc <= 1` else a fresh copy. (3) New `AssignIndex` JIT IR node. (4) `lowerAssignLValue` handles `t(i)=v` with 1-3 scalar indices on real tensors. (5) Codegen's hoist pass was loosened so write-target tensor params go through `unshare` once at function entry and then hoist data/len/shape like the read-only case. | stage 04: 4188ms → 31ms (**135×**, ratio 0.98× matlab). stage 07: 8893ms → 44ms (**202×**, ratio 1.20× matlab — it auto-JIT'd because while-stack only needed scalar push/pop). |
 
 ## Cumulative results vs. the original baseline
 
-Before any work this session vs. after `d6f7ea6`. matlab numbers
+Before any work this session vs. after the stage-4 work. matlab numbers
 are run-to-run noise (~10% spread).
 
 | stage | matlab | numbl before | numbl after | speedup | ratio (nb/ml) |
 |---|---|---|---|---|---|
-| stage_01_scalar_arith | ~57ms | ~320ms | ~287ms | 1.12× | 5.07× |
-| stage_02_scalar_tensor_reads | ~70ms | ~1311ms | ~194ms | **6.76×** | 2.90× |
-| stage_03_nested_with_compare | ~50ms | ~933ms | ~98ms | **9.52×** | 1.79× |
-| stage_04_scalar_write | ~30ms | ~4188ms | (still no JIT — bails on `t(i)=v`) | — | — |
+| stage_01_scalar_arith | ~58ms | ~320ms | ~293ms | 1.09× | 5.06× |
+| stage_02_scalar_tensor_reads | ~76ms | ~1311ms | ~198ms | **6.62×** | 2.61× |
+| stage_03_nested_with_compare | ~47ms | ~933ms | ~99ms | **9.42×** | 2.11× |
+| stage_04_scalar_write | ~32ms | ~4188ms | **~31ms** | **135×** | **0.98×** |
 | stage_05_slice_read | ~95ms | ~6509ms | (still no JIT — bails on `t(:,i)`) | — | — |
-| stage_06_slice_write | ~91ms | ~6653ms | (still no JIT — bails on `t(a:b)=v`) | — | — |
-| stage_07_while_stack | ~35ms | ~8893ms | (still no JIT — bails on `t(i)=v` inside while) | — | — |
-| stage_08_full_bvh_query | ~98ms | ~7532ms | (still no JIT — bails on every feature above) | — | — |
+| stage_06_slice_write | ~93ms | ~6881ms | (still no JIT — bails on `t(a:b)=v`) | — | — |
+| stage_07_while_stack | ~37ms | ~8893ms | **~44ms** | **202×** | **1.20×** |
+| stage_08_full_bvh_query | ~100ms | ~7532ms | (2 sub-loops JIT, outer bails on slice read) | — | — |
+
+**Stage 7 was a free win.** It uses the while-loop push/pop pattern on
+an integer stack tensor, which only needs scalar indexed read and
+scalar indexed write — both of which stage 4 enables. No stage-7-specific
+changes were needed; it auto-JIT'd as soon as scalar writes landed.
+
+**Stage 8 is now partially JIT'd.** Two of its inner sub-loops (the
+BVH-walk sibling loops at line 81) compile cleanly now that scalar
+writes work. The outer driver loop still bails because the BVH query
+uses slice reads (`pt = pts(:, i)`) to extract each query point. Once
+stages 5-6 land, stage 8 should collapse as well.
 
 **Stage 1 is at the V8 ceiling.** Verified by hand-writing the exact
 generated JS and timing it under bare `node`: pure JS = 342ms, our JIT
@@ -240,251 +252,85 @@ inlining at the call site (which the user wants to avoid for codegen
 cleanness) or convincing V8 to bake the hoisted-rows constant. Not
 worth pursuing until stages 4-8 land.
 
-## What's next: stages 4-8 (JIT coverage)
+## What's next: stages 5, 6, 8 (JIT coverage)
 
-The interpreter-side fallback for stages 4-8 is between 60× and 250×
-slower than MATLAB. These are the JIT-coverage gaps that need to be
-filled in `jitLower.ts`:
+Stages 4 and 7 are done. What's left:
 
-- **stage 4** — `Stmt: AssignLValue` whose lvalue is `Index` with
-  scalar indices on a tensor base. Need a `set1r_h / set2r_h / set3r_h`
-  helper family mirroring the read helpers.
 - **stage 5** — `Expr: Colon` and `Expr: Range`, plus `Index` with
   mixed scalar+colon/range indices producing a small tensor. Codegen
   needs slice-read helpers (`slice2r_h(data, ..., kind)` or similar).
 - **stage 6** — `AssignLValue: Index(range...)`. Slice-write helper.
-- **stage 7** — should "just work" once stage 4 lands; the body uses
-  scalar push/pop on a stack tensor.
-- **stage 8** — combines all of stages 4-7 in the BVH walker. Should
-  JIT cleanly once 4-6 land.
+- **stage 8** — combines all of stages 4-7 in the BVH walker. The
+  two sub-loops already JIT; the outer driver bails on slice reads.
+  Should JIT cleanly once 5-6 land.
 
-Each of these will land with a corresponding test in
-`numbl/numbl_test_scripts/jit/`, plus a re-measurement of the
-matching jit-benchmark stage. The stage runner already verifies
-correctness against MATLAB on every run.
+Each of these lands with a corresponding correctness test in
+`numbl/numbl_test_scripts/indexing/` plus a re-measurement of the
+matching jit-benchmark stage.
 
-## Pre-existing JIT test failures (not from this work)
+## Dead code removed
 
-`numbl_test_scripts/jit/` has 9 pre-existing failures on `main` from
-before this work. They're all `%!jit` annotation mismatches where the
-expected line number drifted from the actual. Verified by `git stash`-ing
-the perf changes and re-running — same failures. **Not regressions.**
+`numbl_test_scripts/jit/` (along with the `test:jit` npm script,
+`parseJitAnnotations` in cli.ts, and the `%!jit` annotation matcher)
+was removed. Background: the directory housed 13 tests that used line-
+number-based `%!jit funcName@lineNumber` directives to assert that a
+specific call site actually JIT'd. Every edit shifted the line numbers
+and 9 of 13 tests were already stale before this work. The annotation
+system was also limited to function-call shapes and couldn't express
+loop JIT at all. With the removal:
 
-## Stage 4 implementation guide (the next thing to do)
+- Correctness tests live in their natural home (e.g. the stage-4
+  scalar-write test moved to `numbl_test_scripts/indexing/
+  test_loop_indexed_assign.m`) and run as part of the normal
+  `run_all.sh` suite.
+- JIT-fires verification happens via the benchmark runner, which
+  dumps the JIT function list per stage and compares numbl vs.
+  MATLAB output on every run.
 
-Stage 4 is the first JIT-coverage gap and the biggest single perf cliff
-left in the suite (~140× ratio in the no-JIT fallback). It introduces
-**scalar tensor write**: `t(i) = v` where `t` is a real tensor base,
-`i` is a scalar integer index, and `v` is a scalar number.
+## What was learned landing stage 4
 
-### What the AST looks like
+The design went exactly as `git log -p` shows. A few notes in case the
+same pattern comes up for stages 5-6:
 
-```matlab
-out_pt(nhit) = i;
-```
-
-parses to:
-
-```ts
-{
-  type: "AssignLValue",
-  lvalue: {
-    type: "Index",
-    base: { type: "Ident", name: "out_pt" },
-    indices: [
-      { type: "Ident", name: "nhit" },  // scalar number
-    ],
-  },
-  expr: { type: "Ident", name: "i" },
-}
-```
-
-`AssignLValue` is currently not handled in `lowerStmt` ([jitLower.ts:401-444](../../numbl/src/numbl-core/interpreter/jit/jitLower.ts#L401-L444))
-— the switch has cases for `Assign`, `If`, `For`, `While`, `Break`,
-`Continue`, `Return`, `MultiAssign`, but no `AssignLValue`. The default
-arm returns `null`, which bails the whole loop to the interpreter. That
-single missing case is what makes stage 4 fall over the cliff.
-
-### COW (copy-on-write) — the correctness gotcha
-
-Numbl tensors use refcount-based COW. Reading
-[`shareRuntimeValue`](../../numbl/src/numbl-core/runtime/utils.ts#L72) and
-[`indexStore`](../../numbl/src/numbl-core/runtime/runtimeIndexing.ts#L433):
-
-- Every tensor has `_rc: number` (reference count).
-- `share(t)` returns a wrapper that bumps `_rc` and shares the same
-  `data` Float64Array. Multiple variables can hold "the same" tensor
-  this way.
-- Before mutating in place, the runtime checks `_rc > 1` and **copies
-  the data array** if shared. This is what makes `t(i) = v` look like
-  pure-functional assignment from MATLAB's perspective even though we
-  mutate Float64Arrays under the hood.
-
-The JIT helper for stage 4 must respect this. Two valid strategies:
-
-**Strategy A (preferred): unshare-once at loop entry.** At the top of
-the loop function, for each tensor that we will write to inside the
-body, call `$h.unshare(t)`. This either returns `t` unchanged (if `_rc
-== 1`) or returns a fresh copy with `_rc == 1`. Reassign the local
-parameter to the returned tensor, then hoist `t.data` etc. Subsequent
-mutations are direct array writes — fast.
-
-```js
-function $loop_for(npts, pts, nrect, rects, nhit, out_pt, out_rect) {
-  out_pt = $h.unshare(out_pt);
-  out_rect = $h.unshare(out_rect);
-  var $out_pt_data = out_pt.data;
-  var $out_pt_len = $out_pt_data.length;
-  var $out_rect_data = out_rect.data;
-  var $out_rect_len = $out_rect_data.length;
-  // ...read-only hoists for pts, rects as before...
-
-  for (var $t1 = 1; $t1 <= npts; $t1 += 1) {
-    // ...
-    if (...) {
-      nhit = nhit + 1;
-      $h.set1r_h($out_pt_data, $out_pt_len, nhit, i);
-      $h.set1r_h($out_rect_data, $out_rect_len, nhit, j);
-    }
-  }
-  return [nhit, out_pt, out_rect];  // out_pt gets written back to env
-}
-```
-
-**Strategy B (don't bother): per-write COW check inside the helper.**
-Each write does the `_rc > 1 ? copy : mutate` dance. Correct but
-defeats the whole point of hoisting.
-
-Go with strategy A.
-
-### Files to change
-
-1. **[`jitTypes.ts`](../../numbl/src/numbl-core/interpreter/jit/jitTypes.ts)**
-   — add a new IR node:
-
-   ```ts
-   | { tag: "AssignIndex"; baseName: string; indices: JitExpr[]; value: JitExpr; baseType: JitType }
-   ```
-
-2. **[`jitLower.ts`](../../numbl/src/numbl-core/interpreter/jit/jitLower.ts)**
-   `lowerStmt` — add an `AssignLValue` case that lowers when:
-   - `lvalue.type === "Index"`
-   - `lvalue.base.type === "Ident"` (no chained Index/Member)
-   - `lvalue.indices.length` is 1, 2, or 3
-   - All indices lower to scalar number type
-   - The base var is in env with `kind === "tensor"`, `isComplex === false`
-   - The value lowers to a scalar number type
-   - (Otherwise return null and bail.)
-
-   Update the env type for the base var to itself (it's still a tensor
-   with the same shape — only one element changed).
-
-3. **[`jitCodegen.ts`](../../numbl/src/numbl-core/interpreter/jit/jitCodegen.ts)**:
-
-   - Add an `AssignIndex` case in `emitStmt` that uses the hoisted
-     alias (always available because the unshare hoist below puts the
-     base in `_hoistedAliases`).
-   - Extend the hoist logic in `generateJS` so that any tensor param
-     **assigned in the loop body** (i.e. it IS in `outputs` / `localSet`)
-     is hoisted via the unshare path: emit
-     `${m} = $h.unshare(${m}); var $${m}_data = ${m}.data; ...`
-     instead of skipping. Today the hoist explicitly excludes such
-     params; loosen that condition for write-targets.
-   - Make sure `_hoistedAliases` is populated for write-target tensors
-     so `emitIndex` (read path) and `emitStmt` (write path) both find
-     the alias.
-
-4. **[`jitHelpers.ts`](../../numbl/src/numbl-core/interpreter/jit/jitHelpers.ts)**:
-
-   - Add `unshare(t)` that returns `t` if `t._rc <= 1`, else returns a
-     freshly-cloned tensor with the same shape and a copied `data` (and
-     `imag` if present) and `_rc: 1`.
-   - Add `set1r_h`, `set2r_h`, `set3r_h` mirroring the read helpers:
-
-     ```ts
-     function set1r_h(data: FloatXArrayType, len: number, i: number, v: number): void {
-       const idx = (i - 1) | 0;
-       if (idx >>> 0 >= len) bce();
-       data[idx] = v;
-     }
-     function set2r_h(
-       data: FloatXArrayType,
-       len: number,
-       rows: number,
-       ri: number,
-       ci: number,
-       v: number
-     ): void {
-       const r = (ri - 1) | 0;
-       const c = (ci - 1) | 0;
-       const lin = c * rows + r;
-       if (lin >>> 0 >= len) bce();
-       data[lin] = v;
-     }
-     // set3r_h analogous, with d0 and d1 args
-     ```
-   - Register all of these in the destructured exported helpers list at
-     the bottom of the file.
-
-5. **[`numbl_test_scripts/jit/test_loop_indexed_assign.m`](../../numbl/numbl_test_scripts/jit/)**
-   (new file) — the test that asserts the JIT actually fires and
-   produces correct results for scalar tensor writes. Pattern:
-
-   ```matlab
-   t = zeros(100, 1);
-   for i = 1:100
-     t(i) = i * 2;
-   end
-   assert(t(50) == 100, 'scalar 1D write failed');
-   assert(t(100) == 200, 'last write failed');
-   %!jit loop:for@2
-   disp('SUCCESS');
-   ```
-
-   And a 2D version. The `%!jit` annotation makes the test runner
-   verify the loop actually JIT'd (didn't silently fall back).
-
-### Verification checklist after implementing
-
-1. `cd ~/src/numbl && npx tsc -b` — typechecks.
-2. `cd ~/src/numbl && timeout 300 npx tsx src/cli.ts run-tests numbl_test_scripts/control_flow` — passes 17/17.
-3. `cd ~/src/numbl && timeout 300 npx tsx src/cli.ts run-tests numbl_test_scripts/indexing` — passes 18/18.
-4. `cd ~/src/numbl && timeout 300 npx tsx src/cli.ts run-tests numbl_test_scripts/arithmetic` — passes 21/21.
-5. `cd ~/src/numbl && timeout 300 npx tsx src/cli.ts run-tests numbl_test_scripts/jit` — same 9 pre-existing failures, no new ones.
-6. `cd ~/src/numbl-chunkie-benchmark/jit-benchmarks && node run_stages.mjs stage_04` — `jit fns: 1`, ratio dropped from ~145× to single digits, check passes.
-7. Re-run stages 1-3 to confirm no regression.
-8. `numbl run` the chunkie benchmark and confirm no regression in the build_matrix / interior / eval phases.
-
-### Expected stage 4 result
-
-Pure JS for the stage 4 inner loop is well under 100ms (similar to
-stage 3's pure JS at 37ms — same data sizes, just one extra write per
-hit). With the JIT path landed, expect numbl to drop from **3.86s →
-under 200ms** — somewhere in the 50-150ms range, putting the ratio in
-the 1.5×-5× zone like stage 3.
-
-If it's much higher than that, the most likely culprits are:
-
-- `unshare` is being called per iter instead of once at entry → fix the hoist
-- Bounds check is doing two compares instead of one → use `>>> 0`
-- The output set wasn't filtered by sibling-tail liveness → check the writeback array
-
-Use the standalone JS bisection technique from "Methodology" above to
-isolate the cause.
+- The unshare-once-at-entry strategy is cheap because `$h.unshare(t)`
+  is a single branch on `_rc <= 1` in the fast path. V8 inlines it.
+  Measured stage-4 ratio is 0.98× matlab — we actually beat matlab,
+  which is the first time that's happened in this benchmark.
+- The loop analyzer already treats an `Index` lvalue base as both
+  assigned and referenced (`walkLValue` in jitLoopAnalysis.ts). That
+  means a write-target tensor automatically ends up in both the input
+  set (so the JIT function takes it as a param) and the output set
+  (so the writeback path returns the unshared reference). No extra
+  analyzer work was needed.
+- The hoist pass needed a new "write target" code path distinct from
+  the read-only path: the old condition `!outputSet.has(name) &&
+  !localSet.has(name)` excluded both plain reassignments (`t = t+1`,
+  which correctly can't be hoisted) AND scalar-indexed writes (which
+  can be, via unshare). Splitting `outputSet.has(name) &&
+  isWriteTarget` from plain `localSet.has(name)` is what makes the
+  new path work.
+- The JIT cache key already includes `input types`, and the tensor
+  type doesn't change across iters (same shape, same isComplex). So
+  a single lowering is enough — we don't need re-specialization when
+  the refcount changes.
 
 ## Current branch state (for resuming after compaction)
 
-- numbl: `main` at `d6f7ea6`, pushed to `origin/main`. Working tree clean.
-- numbl-chunkie-benchmark: `main` at `52ffa21`, pushed to `origin/main`. Working tree clean.
+- numbl: `main` at `950d413`, pushed. Working tree clean.
+- numbl-chunkie-benchmark: `main` at `a8f95d0` pre-update; this commit
+  updates PERF_NOTES.md and README.md with the stage-4 results.
 
-The four numbl commits made this round, in order:
+The numbl commits made so far for the loop JIT work, in order:
 - `34d107a` Fix --dump-js double-printing JIT compilations
 - `db20187` JIT: specialized fast helpers for real-tensor scalar reads
 - `1a30b64` JIT: build per-runtime helpers via spread for stable hidden class
 - `d6f7ea6` JIT: hoist tensor base reads, clean conditionals, prune dead loop outputs
+- `cb2eb8b` JIT: scalar tensor write via hoisted unshare (**stage 4**)
+- `950d413` Remove obsolete numbl_test_scripts/jit/ and %!jit annotation matcher
 
-The benchmark commit:
+The benchmark commits:
 - `52ffa21` Add jit-benchmarks suite for staged loop-JIT improvements
+- `a8f95d0` PERF_NOTES: add stage 4 implementation guide and branch state
 
 ## Cheat sheet for the next session
 
