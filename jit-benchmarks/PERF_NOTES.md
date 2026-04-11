@@ -416,10 +416,10 @@ same pattern comes up for stages 5-6:
 
 ## Current branch state (for resuming after compaction)
 
-- numbl: stage 6 committed locally on `main`, **not pushed**.
+- numbl: `main` at `fc76ddb` — stage 6 committed locally, **not pushed**.
   Working tree clean.
-- numbl-chunkie-benchmark: stage 6 docs committed locally on `main`,
-  **not pushed**. Working tree clean.
+- numbl-chunkie-benchmark: `main` at `9e3a765` — stage 6 docs committed
+  locally, **not pushed**. Working tree clean.
 
 The numbl commits made so far for the loop JIT work, in order:
 - `34d107a` Fix --dump-js double-printing JIT compilations
@@ -429,7 +429,7 @@ The numbl commits made so far for the loop JIT work, in order:
 - `cb2eb8b` JIT: scalar tensor write via hoisted unshare (**stage 4**)
 - `950d413` Remove obsolete numbl_test_scripts/jit/ and %!jit annotation matcher
 - `9318236` JIT: slice reads via alias substitution (**stage 5**)
-- _stage 6 commit hash filled in after `git commit`_
+- `fc76ddb` JIT: range-slice writes via setRange1r_h + hoist refresh on reassign (**stage 6 + stage 8**)
 
 The benchmark commits:
 - `52ffa21` Add jit-benchmarks suite for staged loop-JIT improvements
@@ -437,7 +437,7 @@ The benchmark commits:
 - `be1ca40` PERF_NOTES + README: stage 4 landed (scalar tensor write)
 - `ff5fe2c` PERF_NOTES + README: stage 5 landed (slice reads)
 - `14298fb` PERF_NOTES: branch state with stage-5 commit hashes
-- _stage 6 doc commit hash filled in after `git commit`_
+- `9e3a765` PERF_NOTES + README: stage 6 landed (slice writes)
 
 ## Cheat sheet for the next session
 
