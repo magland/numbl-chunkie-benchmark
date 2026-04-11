@@ -4,25 +4,36 @@
 - **Date:** 2026-04-11
 - **Relative tolerance:** `1e-8`
 
+## Environment
+
+| | |
+| --- | --- |
+| platform | linux 6.12.74+deb13+1-amd64 (x64) |
+| cpu | 13th Gen Intel(R) Core(TM) i7-1355U × 12 |
+| memory | 41.9 GB |
+| node | v24.14.1 |
+| matlab | R2025b |
+| numbl | v0.1.6 @ [`c06ad55`](https://github.com/flatironinstitute/numbl/commit/c06ad55) |
+
 ## Timing summary
 
 | metric | matlab | numbl | ratio (nb/ml) |
 | --- | --- | --- | --- |
-| startup | 3.813s | 994ms | 0.26x |
-| execution | 4.549s | 20.74s | 4.56x |
+| startup | 3.772s | 1.002s | 0.27x |
+| execution | 4.560s | 18.92s | 4.15x |
 
-Chunkie install time is excluded from both rows above (matlab: 2.513s, numbl: 800ms).
+Chunkie install time is excluded from both rows above (matlab: 2.478s, numbl: 791ms).
 
 ## Phase timings
 
 | phase | matlab | numbl | ratio (nb/ml) |
 | --- | --- | --- | --- |
-| discretize | 94ms | 436ms | 4.65x |
-| build_matrix | 3.023s | 7.846s | 2.59x |
-| solve | 325ms | 387ms | 1.19x |
-| interior | 299ms | 1.510s | 5.06x |
-| eval | 714ms | 10.52s | 14.72x |
-| **sum** | 4.455s | 20.69s | 4.65x |
+| discretize | 87ms | 446ms | 5.12x |
+| build_matrix | 3.093s | 6.040s | 1.95x |
+| solve | 284ms | 395ms | 1.39x |
+| interior | 290ms | 1.476s | 5.08x |
+| eval | 715ms | 10.52s | 14.71x |
+| **sum** | 4.469s | 18.88s | 4.22x |
 
 ## Result checks
 

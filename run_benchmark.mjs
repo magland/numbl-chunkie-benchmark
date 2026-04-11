@@ -8,6 +8,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import os from 'node:os';
 
 const run = promisify(execFile);
 const NUMBL_CLI = path.resolve('../numbl/src/cli.ts');
@@ -109,6 +110,39 @@ async function checkNumblNativeAddon() {
   return info;
 }
 
+async function numblGitInfo(packageDir) {
+  const out = {};
+  try {
+    const { stdout } = await run('git', ['-C', packageDir, 'rev-parse', '--short', 'HEAD']);
+    out.commit = stdout.trim();
+  } catch {
+    out.commit = null;
+  }
+  try {
+    const { stdout } = await run('git', ['-C', packageDir, 'status', '--porcelain']);
+    out.dirty = stdout.trim().length > 0;
+  } catch {
+    out.dirty = false;
+  }
+  return out;
+}
+
+function systemInfo() {
+  const cpus = os.cpus();
+  const cpuModel = cpus[0]?.model?.replace(/\s+/g, ' ').trim() ?? 'unknown';
+  return {
+    platform: `${os.platform()} ${os.release()} (${os.arch()})`,
+    cpu: `${cpuModel} × ${cpus.length}`,
+    memGB: (os.totalmem() / 1e9).toFixed(1),
+    node: process.version,
+  };
+}
+
+function parseMatlabVersion(out) {
+  const m = out.match(/MATLAB_VERSION:\s*(\S+)/);
+  return m ? m[1] : null;
+}
+
 async function main() {
   const scriptArg = process.argv[2] || DEFAULT_SCRIPT;
   const scriptPath = path.resolve(scriptArg);
@@ -117,12 +151,21 @@ async function main() {
   console.log(`script: ${scriptArg}`);
   const info = await checkNumblNativeAddon();
   console.log(`numbl native addon: ${info.nativeAddonPath}`);
+  const numblGit = await numblGitInfo(info.packageDir);
+  const sys = systemInfo();
+  console.log(`system: ${sys.platform} | ${sys.cpu} | ${sys.memGB} GB RAM`);
+  console.log(
+    `numbl: v${info.version} @ ${numblGit.commit ?? 'unknown'}${numblGit.dirty ? '-dirty' : ''}`
+  );
   console.log('running matlab...');
-  const ml = await timed('matlab', ['-batch', `run('${scriptPath}')`]);
+  const mlCmd =
+    `fprintf('MATLAB_VERSION: %s\\n', version('-release')); run('${scriptPath}')`;
+  const ml = await timed('matlab', ['-batch', mlCmd]);
   console.log(`  wall: ${ml.wall.toFixed(2)}s`);
   console.log('running numbl...');
   const nb = await timed('npx', ['tsx', NUMBL_CLI, 'run', scriptPath]);
   console.log(`  wall: ${nb.wall.toFixed(2)}s`);
+  const matlabVersion = parseMatlabVersion(ml.stdout) ?? 'unknown';
 
   const mlP = parse(ml.stdout + '\n' + ml.stderr);
   const nbP = parse(nb.stdout + '\n' + nb.stderr);
@@ -150,6 +193,17 @@ async function main() {
 - **Script:** \`${scriptArg}\`
 - **Date:** ${new Date().toISOString().slice(0, 10)}
 - **Relative tolerance:** \`${RTOL}\`
+
+## Environment
+
+| | |
+| --- | --- |
+| platform | ${sys.platform} |
+| cpu | ${sys.cpu} |
+| memory | ${sys.memGB} GB |
+| node | ${sys.node} |
+| matlab | R${matlabVersion} |
+| numbl | v${info.version} @ [\`${numblGit.commit ?? 'unknown'}${numblGit.dirty ? '-dirty' : ''}\`](https://github.com/flatironinstitute/numbl/commit/${numblGit.commit ?? ''}) |
 
 ## Timing summary
 

@@ -23,7 +23,11 @@ Exits non-zero if any `CHECK` value differs between MATLAB and numbl by more tha
 
 - `matlab` on `PATH` (invoked as `matlab -batch ...`)
 - numbl checked out at `../numbl` (invoked as `npx tsx ../numbl/src/cli.ts run ...`)
-- chunkie installed via `mip` in both engines (benchmarks call `mip load --install chunkie`)
+- chunkie installed via `mip` in both engines (benchmarks call `mip load --install chunkie`).
+  `mip` itself must be installed for MATLAB — see [mip.sh](https://mip.sh).
+  Once both are installed, the chunkie sources `mip` loads live at:
+  - MATLAB: `~/Documents/MATLAB/mip/packages/mip-org/core/chunkie`
+  - numbl:  `~/.numbl/mip/packages/mip-org/core/chunkie`
 
 ## Authoring a benchmark
 
