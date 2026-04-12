@@ -652,19 +652,96 @@ flat-tensor stage 8 variant already demonstrates.
 
 ## Current branch state (for resuming after compaction)
 
-- numbl: stages 1–11 landed. Stage 11 at HEAD. The numbl test is
+- numbl: stages 1–11 landed. Stage 11 at `6c2bc6f`. The numbl test is
   `numbl_test_scripts/indexing/test_loop_vconcat_grow.m`. All commits
   local, **not pushed**.
-- numbl-chunkie-benchmark: stage 11 docs at HEAD. Stages 12–14 still
-  in the WIP lineup (all BAIL).
+- numbl-chunkie-benchmark: stage 11 docs at `9adcbbf`. Stages 12–14
+  still in the WIP lineup (all BAIL).
+
+### Non-obvious details from landing stage 11 (don't relearn these)
+
+- **`[]` empty matrix already lowered correctly before stage 11.** The
+  existing `case "Tensor"` handles zero-row input as a no-op through
+  the row-element iteration, producing a `TensorLiteral { rows: [],
+  nRows: 0, nCols: 0 }` with type `tensor[0x0]` and codegen
+  `$h.mkTensor([], [0, 0])`. So stage 11 only had to handle the
+  vconcat growth pattern, not the empty literal.
+- **The lowering permissively accepts ANY real tensor base for
+  VConcatGrow**, not just statically-known column vectors. This is
+  required for fixed-point convergence: on the 2nd inner-loop pass,
+  the merged `it` type has shape `[?, ?]` (can't be proven a column
+  vec at type time), but the helper checks at runtime. A stricter
+  type check would need a tri-state "column-vec-or-unknown" flag
+  which isn't worth the machinery.
+- **Hoist pass visitor needs an explicit `case "VConcatGrow":`** that
+  recurses into `base` and `value`. `default: return;` would swallow
+  the recursion. Neither child contributes to max-index-dim counts
+  (base is emitted as a whole-tensor Var, not an index read), but
+  `value` may contain nested index reads on OTHER tensors that must
+  be picked up for hoisting.
+- **`it` is a plain-Assign target only**, never an `AssignIndex`. The
+  hoist pass correctly sets `isWriteTarget=false`, so the per-Assign
+  refresh doesn't call `$h.unshare()` — which is right because
+  `vconcatGrow1r` already returns a fresh tensor with `_rc === 1`.
+- **`isempty(it)` and `length(it)` fall through to IBuiltin calls**
+  (`$h.ib_isempty(it)` / `$h.ib_length(it)`) — their `jitEmit`
+  fast-paths only inline for scalar types. For the tensor case, the
+  per-call helper hop costs one V8 method call per execution; fine
+  because these are outside the inner-inner loop. A future
+  optimization could add a `jitEmit` branch for tensors that emits
+  `($it_len === 0 ? 1 : 0)` etc. directly, but stage 11 doesn't need
+  it — ratio 1.93× is dominated by the per-iter allocation, not
+  these calls.
+- **Type unification for `[0,0]` + `[-1,1]`** works because both have
+  `shape.length === 2`, so `unifyJitTypes` maps element-wise:
+  `shape[0]: 0 → -1`, `shape[1]: 0 vs 1 → -1`, result `[-1, -1]`.
+  The fixed point converges after one re-pass of the inner loop body.
+- **Where the helper lives**: `jitHelpers.ts:540` (`vconcatGrow1r`),
+  registered in the export block at `jitHelpers.ts:702`. Both are
+  needed — registering in only one place drops it from `$h`.
 
 ### Stages 12-14 gotchas (for planning ahead)
 
-- **Stage 12 (struct field read)**: New `JitType.kind = "struct"` with
-  a `fields: Record<string, JitType>` map. `lowerExpr` case `Member`
-  becomes a new `MemberRead` JitExpr that codegens to a JS property
-  load. The struct must be loop-invariant (created outside) so the
-  field offset is stable. Small test: `opts.k`, `opts.tol`, etc.
+- **Stage 12 (struct field read)**: New `JitType.kind = "struct"`
+  *already exists* in `jitTypes.ts` with an optional
+  `fields?: Record<string, JitType>` map — unifyJitTypes already
+  handles merging two struct types field-by-field. What's missing:
+  - (a) **No `case "Member":` in `lowerExpr`** in `jitLower.ts` at
+    all — `Member` exprs currently fall through to the default `null`
+    return and the loop bails. Need to add a new case that looks up
+    the base's type, checks it's a struct with a known field, and
+    emits a new IR node for the scalar field read.
+  - (b) **No new runtime helper needed**, but codegen is subtle:
+    `RuntimeStruct.fields` is a **`Map<string, RuntimeValue>`**
+    (see `runtime/types.ts:139`), NOT a plain object. So `opts.k` at
+    runtime is `opts.fields.get("k")`, not `opts.k`. That's a slower
+    access than a JS property load, so the right move is to **hoist
+    each referenced scalar field at function entry** the same way
+    tensors hoist `.data`/`.length` — e.g. `var $opts_k =
+    opts.fields.get("k")` at the top, then every `opts.k` use in the
+    body becomes a bare `$opts_k` reference.
+  - (c) **The struct must be loop-invariant** (created outside and
+    never reassigned inside the loop). The hoist-at-entry pattern
+    only works if the runtime value doesn't change — mirrors the
+    restriction we already have for tensor writes. For scalar-only
+    field reads, the chunkie pattern (`opts.rho`, `chnkr.k`) is
+    always loop-invariant, so this is fine.
+  - (d) **New IR node**: `{ tag: "MemberRead"; base: JitExpr;
+    fieldName: string; jitType }`. Or extend `Index` — the existing
+    tag has `base` + `indices`, so a string "index" could work, but
+    it muddies the type. Cleaner to introduce `MemberRead` as a new
+    tag and keep the matching hoist alias map keyed on
+    `"${baseName}.${fieldName}"`.
+  - (e) **The loop analyzer already walks `expr.type === "Member"`**
+    correctly (`jitLoopAnalysis.ts:275`) — it adds the struct's base
+    Ident to `referenced`, so the struct becomes a JIT function
+    parameter automatically. No change needed there.
+  - (f) **Test placement**: use `numbl_test_scripts/struct/` (I saw
+    the directory name in `ls` output is plural "structs", not
+    "struct" — double-check before creating). Test multiple field
+    types (number, boolean) and verify against scalar-only refs.
+  - (g) **Only scalar fields** for stage 12. Tensor-typed fields and
+    struct-array chained access are stage 13.
 
 - **Stage 13 (struct array chained)**: This is the big one. Need a
   new `struct_array` JitType. Lower `T.nodes(inode)` as a "row alias"
