@@ -745,14 +745,14 @@ the same range as stage 10 (and-or fold), which was also "pure scalar
 arithmetic with a small fix-up". Stages 1–11 showed no regressions
 in the same sweep.
 
-## Current branch state (for resuming after compaction)
+## Current branch state (pre-stage-13 — historical)
 
 - numbl: stages 1–12 landed. Stage 12 at `e7ba0f4`. The numbl test
   for stage 12 is
   `numbl_test_scripts/structs/test_loop_struct_field_read.m`. All
-  commits local, **not pushed**.
-- numbl-chunkie-benchmark: stage 12 docs at the commit below. Stages
-  13–14 still in the WIP lineup (all BAIL).
+  commits local, **not pushed**. See the "Current branch state
+  (stage 13 landed)" section below for the up-to-date state after
+  stage 13.
 
 ### Non-obvious details from landing stage 11 (don't relearn these)
 
@@ -843,23 +843,222 @@ in the same sweep.
 - **Test placement**: `numbl_test_scripts/structs/` (plural — the
   directory was already there with other struct tests).
 
-### Stages 13-14 gotchas (for planning ahead)
+## What was learned landing stage 13
 
-- **Stage 13 (struct array chained)**: This is the big one. Need a
-  new `struct_array` JitType. Lower `T.nodes(inode)` as a "row alias"
-  analogous to slice aliases: no Row struct materialization. Chained
-  `Member(Index(Member(T, nodes), [i]), chld)` substitutes through to
-  a direct field-storage read at the leaf. The question is how
-  numbl's runtime stores struct arrays — likely as a per-field typed
-  storage, in which case the read collapses to
-  `T_nodes_chld.get(inode - 1)`. Check the runtime implementation
-  before designing the JitType. Start with
-  `grep -rn "RuntimeStructArray\|struct_array" src/numbl-core/runtime/`.
+Stage 13 was a modest-sized change: one new IR tag, a new JitType kind,
+a nested-structure case in `inferJitType`, a chained-pattern recogniser
+in `lowerExpr`, and a new hoist/walker/emit trio in the codegen — plus
+**two non-obvious pre-existing bugs** that only surfaced because the
+stage 13 correctness test exercises the live-out + loop-output paths
+that the earlier stages didn't.
 
-- **Stage 14 (full struct ptloop)**: Combines 9–13 on top of 1–8. No
-  new capability, just the integration test. If 9–13 all land
-  cleanly, stage 14 should JIT as one loop function — the same thing
-  that happened going from stages 1–7 to stage 8.
+### The stage-13 lowering design
+
+- **Parser shape**: `T.nodes(inode).val` parses as
+  `Member(MethodCall(Ident(T), "nodes", [inode]), "val")` in read
+  position — the middle node is **MethodCall**, not `Index(Member(...))`.
+  In MATLAB surface syntax the `.ident(` sequence is a method-call
+  postfix, so the postfix parser in `parser/ExpressionParser.ts:320`
+  emits MethodCall. In assignment-lvalue position the same text parses
+  as `Member(Index(Member(T, nodes), [1]), val)` instead; stage 13 only
+  handles the read path.
+- **New `struct_array` JitType** carries `elemFields?: Record<string,
+  JitType>` and optional `length`. It's populated by a nested case in
+  `inferJitType` that's only reached when walking a RuntimeStruct's
+  fields — **top-level struct array values still infer to `unknown`**
+  to preserve the existing builtin-dispatch behavior. Many `match`
+  functions (fieldnames, etc.) only accept `struct / class_instance /
+  unknown`; changing the top-level case to struct_array regresses them.
+  Nesting-only inference is enough for the chunkie pattern, which
+  always accesses `T.nodes(inode).leaf` through a wrapper struct.
+- **New IR tag `StructArrayMemberRead`** holds `structVarName,
+  structArrayFieldName, indexExpr, leafFieldName, jitType`. The
+  lowering is a one-pattern match in `lowerExpr` case `"Member"`:
+  recognize `Member(MethodCall(Ident(T), "nodes", [idx]), "leaf")`,
+  verify `T` is a struct with a struct_array field and the leaf is
+  either a scalar numeric type or a real tensor, and emit the IR.
+- **Codegen hoists `$T_nodes_elements = T.fields.get("nodes").elements`
+  at function entry** (one alias per unique `(structVarName,
+  structArrayFieldName)` pair) and emits per-use
+  `$T_nodes_elements[Math.round(idx) - 1].fields.get("leaf")`. For
+  tensor-typed leaves the result flows through a plain `Assign chld =
+  ...` and the existing per-Assign hoist refresh picks up the fresh
+  `chld.data` / `chld.data.length` aliases so downstream `chld(k)`
+  reads go through the fast scalar-index path. **No extra tensor
+  plumbing needed** — the stage 6 refresh mechanism was already right
+  for this case.
+
+### Pre-existing bugs surfaced by stage 13
+
+Two bugs had been masked by the stage 12 baseline and the specific
+patterns earlier stages used. The stage 13 correctness test exposed
+both, and they had to be fixed before the test could pass.
+
+1. **Output pre-init poisoned the loop-join merge**.
+   `lowerFunction` used to seed every output variable with
+   `{kind: "number", exact: 0, sign: "nonneg"}` so it had *some* type at
+   function exit. The stage 13 pattern `chld = T.nodes(i).chld`
+   produces a **tensor** on first assignment, and `unifyJitTypes(number,
+   tensor)` returns `unknown`, which makes `mergeEnvs` at the loop
+   join fail — and therefore `lowerFor` returns `null` and the whole
+   loop bails. Fix: don't seed any type; rely on the "bail if output
+   never assigned" check later to catch unassigned outputs. Reading an
+   unassigned output is an error anyway — the number=0 sentinel was
+   papering over that while breaking legitimate tensor outputs.
+
+2. **Write-only locals lost their pre-loop value**. With the pre-init
+   removed, an output variable like `clear_i_exists` in
+   ```matlab
+   clear_i_exists = false;
+   for i = 1:0, clear_i_exists = true; end
+   ```
+   becomes a local in the synthetic JIT function but isn't a param
+   (because the body doesn't **reference** it — only writes it). When
+   the loop range is empty the body never runs and the local stays
+   `undefined`, then gets written back to the outer env, corrupting the
+   caller's `clear_i_exists`. The OLD pre-init + type-mismatch bail
+   accidentally avoided this by refusing to JIT such loops. Fix: in
+   `tryJitLoop`, promote any `rawOutputs` name that exists in the outer
+   env to an **input** as well, so its pre-loop value flows through as
+   a param and survives zero-iter loops. The added input is also a
+   normal JIT input for type purposes — widening via `unifyJitTypes`
+   handles the case where the in-body assignment produces a different
+   (but unifiable) type. This promotion doesn't happen for writes to
+   vars that were **unbound** pre-loop, so the fix is scoped to the
+   case that actually matters.
+
+Together these two fixes unblock stage 13 and — as a free bonus — let
+more patterns JIT that previously bailed (e.g. loops that alias a plain
+tensor local inside: `for i..., chld = pool; ..., end`).
+
+### Generated JS (stage 13 bench)
+
+```js
+function $loop_for(n_iters, n_nodes, total_val, T, total_chld) {
+  var i, inode, chld;
+  var $chld_data, $chld_len;
+  var $T_nodes_elements = T.fields.get("nodes").elements;
+  for (var $t1 = 1; $t1 <= n_iters; $t1 += 1) {
+    i = $t1;
+    inode = ($h.mod((i - 1), n_nodes) + 1);
+    total_val = (total_val +
+      $T_nodes_elements[Math.round(inode) - 1].fields.get("val"));
+    chld = $T_nodes_elements[Math.round(inode) - 1].fields.get("chld");
+    $chld_data = chld.data;
+    $chld_len = $chld_data.length;
+    total_chld = ((total_chld + $h.idx1r_h($chld_data, $chld_len, 1)) +
+      $h.idx1r_h($chld_data, $chld_len, 2));
+  }
+  return [i, total_val, total_chld];
+}
+```
+
+Every element lookup is one `.elements[idx]` + one `.fields.get("leaf")`.
+Tensor-typed leaves flow through the existing per-Assign refresh and
+downstream scalar reads go straight through `$chld_data` as if `chld`
+had been a regular loop-local tensor.
+
+**Result**: stage 13 flipped from **BAIL** to **jit** at ratio ~0.07×
+matlab (154ms → 10ms) — about **15× faster than matlab**. Stage 14 —
+the full chunkie ptloop in struct-of-struct form — also flipped from
+**BAIL** to **jit** on the same commit at ratio ~0.9× matlab (~0.86×
+to ~0.97× across runs), compiling as a single loop function with one
+small helper for the rect-init pre-loop. Stages 1–12 show no regressions.
+
+### Why stage 14 isn't faster than matlab the way stage 8 is
+
+Stage 8 (flat-tensor BVH) runs at 0.52× matlab. Stage 14 (struct-of-
+struct BVH) lands at 0.9×. The gap is the per-iter cost of the struct
+array field accesses: two `fields.get("chld")` / `fields.get("xi")`
+calls per node visited, plus the `Map.get` semantics on
+`RuntimeStruct.fields`. Matlab's JIT specializes struct array field
+access to direct column storage; numbl's still goes through the
+`Map<string, RuntimeValue>`. Closing the gap would need either (a)
+switching RuntimeStruct to use a plain object with string-indexed
+properties (huge ripple-effect change), or (b) adding per-field
+storage caching where a struct array's columns are flattened to
+typed arrays at JIT compile time (an optimization-only change, no
+semantics risk). Both are deferred.
+
+## Current branch state (stage 13 landed)
+
+- **numbl**: stages 1–14 JIT cleanly. Stage 13 commit at the hash
+  below. The stage 13 correctness test is
+  `numbl_test_scripts/structs/test_loop_struct_array_chained.m`. All
+  commits local, **not pushed**.
+- **numbl-chunkie-benchmark**: stage 13 + 14 both reporting `jit` in
+  the sweep. Docs updated in this commit.
+
+### Non-obvious details from landing stage 13 (don't relearn these)
+
+- **MethodCall, not Index**. `T.nodes(inode)` in **read** position
+  parses as MethodCall, because the parser's postfix handling treats
+  `.ident(` as a method-call postfix before it would otherwise emit a
+  `Member` + index. The lowering has to match `Member(MethodCall(...))`,
+  not `Member(Index(Member(...)))`. (Use `node dist-cli/cli.js run
+  --dump-ast` to check any time this comes up.)
+- **Nested-only struct_array inference**. `inferJitType` produces
+  `struct_array` for a struct's struct-array field, but NOT for a
+  top-level struct_array runtime value (which still returns `unknown`).
+  That keeps the many existing `match` functions that accept
+  `struct / class_instance / unknown` working unchanged.
+  `inferStructArrayType` is a local helper, only called from the
+  `isRuntimeStruct` branch of `inferJitType`.
+- **The `MethodCall` analyzer walk**. `jitLoopAnalysis.ts:walkExpr`
+  had no case for `MethodCall` pre-stage-13; if it had been left
+  unhandled, `T.nodes(inode)` would not have added `T` or `inode` to
+  `referenced` and the loop JIT would not capture them as inputs.
+  Added a case that mirrors `FuncCall` (walk base, walk args).
+- **Hoist-walker recursion**. Both `collectTensorUsage` and
+  `collectStructFieldReads` needed a new case recursing into
+  `StructArrayMemberRead.indexExpr`; otherwise a `Var(chld, tensor)`
+  used as an index — `T.nodes(chld(k)).leaf` — would miss its tensor
+  hoisting, and struct-scalar reads inside the index would miss their
+  field hoisting.
+- **Tensor-leaf reuses the stage-6 refresh path**. The result of
+  `StructArrayMemberRead` with a tensor leaf type flows through a
+  normal `Assign chld = ...`, which `emitHoistRefresh` already handles
+  by re-reading `chld.data` / `.length` after the assignment. No new
+  refresh machinery needed. `isWriteTarget` stays `false` for these
+  cases (we never use `AssignIndex` on a struct-array-derived tensor),
+  so the refresh skips the `unshare` call — which is correct because
+  we only read the tensor, never mutate it.
+- **`Math.round(idx) - 1` for the 0-based JS index**. The existing
+  tensor helpers all use `Math.round` to match MATLAB's non-integer-
+  index semantics. Re-using that convention keeps the code mentally
+  consistent; a future optimization could narrow this to `(idx|0) - 1`
+  when `idx` is a known-integer loop variable.
+- **Loop-invariance of the struct base**. Same assumption as stage 12:
+  if `T` is reassigned mid-body, the hoisted `$T_nodes_elements` would
+  be stale. But the lowering's env type check bails any reassignment
+  — after `T = 5`, `ctx.env.get("T")` isn't a struct, so subsequent
+  `T.nodes(...).leaf` lowerings return `null`, the whole body lowering
+  returns `null`, and we fall back to the interpreter. The hoist is
+  never read against stale state.
+- **Two pre-existing bugs** (documented above). Don't be surprised
+  that the output-pre-init fix changed behavior for loops whose
+  output type would have clashed with `number=0`; that's the fix, not
+  a regression. Re-run the full test suite (`node dist-cli/cli.js
+  run-tests`) after touching lowerFunction's output handling — 644
+  tests pass on this commit.
+
+### Stage 14 / chunkie gotchas (for planning ahead)
+
+- **Stage 14 is the integration test, not a new capability**. It
+  passed on the same commit that added stage 13. No new work needed;
+  just verify with `node run_stages.mjs stage_14`.
+- **Getting stage 14 below matlab parity** would require attacking
+  the per-iter cost of struct-array field access — either by
+  flattening fields to typed arrays at compile time (an optimization
+  pass) or by switching RuntimeStruct's field storage to plain objects
+  (a ripple-effect change across the runtime). Both are deferred.
+- **The actual chunkie `flagnear_rectangle.m`** should now JIT too.
+  Next step after committing stage 13: point numbl at the chunkie
+  benchmark (ex01 Helmholtz starfish) and see whether the interior
+  phase is faster than matlab. If the numbl side still bails, the
+  diff between stage 14 and `flagnear_rectangle` is the thing to
+  investigate — probably a chunkie construct stage 14 doesn't
+  exercise.
 
 The numbl commits made so far for the loop JIT work, in order:
 - `34d107a` Fix --dump-js double-printing JIT compilations
@@ -875,6 +1074,7 @@ The numbl commits made so far for the loop JIT work, in order:
 - `74ad9c1` JIT: fold and/or/not function-call form to operator form (**stage 10**)
 - `6c2bc6f` JIT: vertical concat growth `[t; v]` via VConcatGrow IR (**stage 11**)
 - `e7ba0f4` JIT: scalar struct field read via MemberRead IR (**stage 12**)
+- `a9714b0` JIT: chained struct array member read via StructArrayMemberRead IR (**stage 13 + stage 14 integration**)
 
 The benchmark commits:
 - `52ffa21` Add jit-benchmarks suite for staged loop-JIT improvements

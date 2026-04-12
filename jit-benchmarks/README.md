@@ -113,26 +113,35 @@ per-stage details and the V8 findings behind the improvements.
 | stage_10_and_or_funccall      | 147ms |  438ms |   19ms |  0.11x | jit |
 | stage_11_concat_growth        | 103ms |    —   |  203ms |  1.93x | jit |
 | stage_12_struct_field_read    | 203ms |    —   |   17ms |  0.08x | jit |
-| stage_13_struct_array_chained | 158ms |    —   |    —   |    —   | **BAIL** |
-| stage_14_chunkie_ptloop_struct| 130ms |    —   |    —   |    —   | **BAIL** |
+| stage_13_struct_array_chained | 155ms |    —   |   10ms |  0.07x | jit |
+| stage_14_chunkie_ptloop_struct| 233ms |    —   |  118ms |  0.51x | jit |
 
-**Stages 1–12 are all JIT'ing.** Stages 4–6, 8, 9, 10, and 12 beat
-matlab (ratio < 1×); stage 12 by ~12× and stage 10 by ~9×; stages 5
-and 9 by ~3.5×. Stage 8, the flat-tensor BVH walker, runs ~1.7× faster
-than matlab. Stage 11 lands at ~1.9× matlab — per-iter allocation for
-tensor growth is the dominant cost and is unavoidable given MATLAB
-growth semantics.
+**Stages 1–14 are all JIT'ing.** Stages 4–6, 8, 9, 10, 12, 13, 14 beat
+or match matlab (ratio ≤ 1×); stage 13 by ~15× and stage 12 by ~12×;
+stage 10 by ~9×; stages 5 and 9 by ~3.5×. Stage 8, the flat-tensor BVH
+walker, runs ~2× faster than matlab. Stage 11 lands at ~1.9× matlab
+— per-iter allocation for tensor growth is the dominant cost and is
+unavoidable given MATLAB growth semantics. Stage 14 — the full chunkie
+`flagnear_rectangle` ptloop in struct-of-struct form — lands at
+~0.5–0.9× matlab (run-to-run variance) on first compile, with the
+faster-matlab bound coming from long warm runs. The gap vs stage 8 is
+the per-iter cost of struct-array field access through
+`RuntimeStruct.fields` Map lookups, not a JIT capability gap.
 
-**Stages 13–14 are the work-in-progress lineup** for getting the actual
-chunkie ptloop (struct-of-struct flavor) to JIT. They currently fail
-the `assert_jit_compiled()` marker. Once stage 13 lands, stage 14
-should JIT as a single loop function — and the chunkie
-`flagnear_rectangle.m` should follow.
+**Stage 14 JITs on the same commit as stage 13** — it's the integration
+test, not a new capability. The actual chunkie `flagnear_rectangle.m`
+should now JIT cleanly as well; run the ex01 Helmholtz starfish
+benchmark to confirm.
 
 ## Capability staging plan (numbl side)
 
 Each stage corresponds to a specific gap in
 `numbl/src/numbl-core/interpreter/jit/jitLower.ts`:
+
+**Note**: the table below reflects the state at stage 13 landing. Stages
+13 and 14 are marked done; the stage 13 row describes the final design
+(chained `Member(MethodCall, leaf)` pattern recognition, not the "row
+alias" sketch that preceded it).
 
 | Stage | Required jitLower change | Status |
 |---|---|---|
@@ -145,8 +154,8 @@ Each stage corresponds to a specific gap in
 | 10 and_or_funccall | In `lowerExpr` case "FuncCall", recognize `and(a, b)` / `or(a, b)` / `not(a)` with simple numeric/boolean scalar args and synthesize a `Binary`/`Unary` JitExpr (`AndAnd`/`OrOr`/`Not`) instead of routing through the IBuiltin call path. Variable shadowing already handled by the env check above. Complex args fall through to IBuiltin (JS truthiness ≠ MATLAB complex truthiness). | **done** |
 | 11 concat_growth | Empty matrix literal `[]` already lowers as `tensor[0x0]` via the existing `TensorLiteral` path. The vertical concat `[base; value]` where `base` is a real tensor and `value` is a numeric scalar gets a new `VConcatGrow` JitExpr tag that codegens to `$h.vconcatGrow1r(base, value)` — a per-iter allocate-and-copy helper returning a fresh `(k+1, 1)` tensor. Type unification at the loop join widens `tensor[0x0]` against `tensor[?x1]` to `tensor[?x?]` element-wise; the fixed-point iterator in `lowerFor` stabilizes after one re-pass. | **done** |
 | 12 struct_field_read | Struct types were already tracked in the type env (`JitType.kind = "struct"` with `fields` map, propagated through `inferJitType`). Added a new `MemberRead` JitExpr tag. `lowerExpr` case `"Member"` recognizes `Ident(base).field` where base has a struct type with a known scalar numeric field and emits a `MemberRead`. Codegen walks the IR collecting unique `(baseName, fieldName)` pairs and hoists each as `var $base_field = base.fields.get("field")` at function entry, so per-iter reads are bare local loads. `RuntimeStruct.fields` is a `Map<string, RuntimeValue>` — hoisting amortizes the one-time `Map.get` cost across the whole loop. | **done** |
-| 13 struct_array_chained | Add a `struct_array` JitType. Lower struct array indexing `s_array(i)` as a "row alias" (analogous to slice aliases) that doesn't materialize a Row struct. Chained `Member(Index(Member(T, nodes), [i]), chld)` substitutes through to a direct field-storage read at the leaf. | todo |
-| 14 struct ptloop target | Combines stages 09–13 on top of 04–07. Same shape as `flagnear_rectangle.m`. | todo |
+| 13 struct_array_chained | Add a `struct_array` JitType kind (with per-field `elemFields` inferred from runtime). Infer struct_array only for nested (struct-field) position to keep existing builtin dispatch unchanged. Recognize the parser shape `Member(MethodCall(Ident(T), "nodes", [i]), "leaf")` in `lowerExpr` and emit a new `StructArrayMemberRead` IR node. Codegen hoists `$T_nodes_elements = T.fields.get("nodes").elements` once per unique `(structVar, field)` pair; per-use reads do `$T_nodes_elements[Math.round(i) - 1].fields.get("leaf")`. Tensor-typed leaves reuse stage 6's existing per-Assign hoist refresh. Also fixes two pre-existing bugs that stage 13 surfaced: removing `lowerFunction`'s `number=0` output pre-init (which poisoned tensor outputs at loop joins) and promoting outputs-in-outer-env to loop-function inputs (so write-only locals survive zero-iter loops). | **done** |
+| 14 struct ptloop target | Combines stages 09–13 on top of 04–07. Same shape as `flagnear_rectangle.m`. JITs as one loop function with one helper loop for the rect-init pre-loop — no new capability needed beyond stage 13. | **done** |
 
 Each capability lands in numbl together with a correctness test in
 `~/src/numbl/numbl_test_scripts/` (typically `indexing/` for slice
