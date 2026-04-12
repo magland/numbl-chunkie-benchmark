@@ -89,7 +89,7 @@ timings, ratios, JIT-fired count and check status.
 | 08 **full_bvh_query** | combines stages 4–7 in a stack-driven BVH traversal with hit accumulation and slice-write growth | the entire ptloop (flat-tensor surrogate) |
 | 09 slice_write_var_src | slice write with a **whole-tensor** RHS: `dst(a:b) = src` | `isp(1:nn) = itemp` (where itemp is a plain Var) |
 | 10 and_or_funccall | fold function-call form `and(a,b)` / `or(a,b)` to JS `&&` / `\|\|` (perf only — already lowers via IBuiltin path, ~3× slower than operator form) | `while(and(is > 0, ntry <= nnodes))` |
-| 11 concat_growth | empty matrix init `it = []` + vertical concat growth `it = [it; i]` | the per-leaf "found" list |
+| 11 **concat_growth** | empty matrix init `it = []` + vertical concat growth `it = [it; i]` via `VConcatGrow` IR + `vconcatGrow1r` helper | the per-leaf "found" list |
 | 12 struct_field_read | scalar `s.f` read where `s` is a struct with known field types | `chnkr.k`, `chnkr.nch`, `opts.rho` |
 | 13 struct_array_chained | struct array indexing + chained Member: `T.nodes(i).chld` | the BVH children/xi access |
 | 14 **chunkie_ptloop_struct** | combines stages 9–13 on top of 1–8: a near-direct copy of `flagnear_rectangle`'s outer for loop in struct-of-struct form | the entire ptloop (struct-of-struct, matches chunkie source) |
@@ -111,18 +111,20 @@ per-stage details and the V8 findings behind the improvements.
 | stage_08_full_bvh_query       | 101ms | 7.532s |   58ms |  0.57x | jit |
 | stage_09_slice_write_var_src  | 188ms |    —   |   53ms |  0.28x | jit |
 | stage_10_and_or_funccall      | 147ms |  438ms |   19ms |  0.11x | jit |
-| stage_11_concat_growth        | 103ms |    —   |    —   |    —   | **BAIL** |
+| stage_11_concat_growth        | 103ms |    —   |  203ms |  1.93x | jit |
 | stage_12_struct_field_read    | 219ms |    —   |    —   |    —   | **BAIL** |
 | stage_13_struct_array_chained | 151ms |    —   |    —   |    —   | **BAIL** |
 | stage_14_chunkie_ptloop_struct| 132ms |    —   |    —   |    —   | **BAIL** |
 
-**Stages 1–10 are all JIT'ing.** Stages 4–6, 8, 9, and 10 beat matlab
+**Stages 1–11 are all JIT'ing.** Stages 4–6, 8, 9, and 10 beat matlab
 (ratio < 1×); stage 10 by ~9×, stages 5 and 9 by ~3.5×. Stage 8, the
-flat-tensor BVH walker, runs ~1.7× faster than matlab.
+flat-tensor BVH walker, runs ~1.7× faster than matlab. Stage 11 lands
+at ~1.9× matlab — per-iter allocation for tensor growth is the
+dominant cost and is unavoidable given MATLAB growth semantics.
 
-**Stages 11–14 are the work-in-progress lineup** for getting the actual
+**Stages 12–14 are the work-in-progress lineup** for getting the actual
 chunkie ptloop (struct-of-struct flavor) to JIT. They currently fail
-the `assert_jit_compiled()` marker. Once stages 11–13 land individually,
+the `assert_jit_compiled()` marker. Once stages 12–13 land individually,
 stage 14 should JIT as a single loop function — and the chunkie
 `flagnear_rectangle.m` should follow.
 
@@ -140,7 +142,7 @@ Each stage corresponds to a specific gap in
 | 08 flat target | All of stages 04–07 must be in place. | **done** (entire flat-tensor BVH ptloop JITs as one loop) |
 | 09 slice_write_var_src | Extend `tryLowerRangeAssign` to accept a plain `Ident` RHS of a real tensor. IR change: `AssignIndexRange.srcStart`/`srcEnd` become nullable — when null the codegen substitutes `1` and the source's hoisted length alias. Same `setRange1r_h` helper handles both shapes; no new helper needed. | **done** |
 | 10 and_or_funccall | In `lowerExpr` case "FuncCall", recognize `and(a, b)` / `or(a, b)` / `not(a)` with simple numeric/boolean scalar args and synthesize a `Binary`/`Unary` JitExpr (`AndAnd`/`OrOr`/`Not`) instead of routing through the IBuiltin call path. Variable shadowing already handled by the env check above. Complex args fall through to IBuiltin (JS truthiness ≠ MATLAB complex truthiness). | **done** |
-| 11 concat_growth | Lower the empty matrix literal `[]` as a tensor `tensor[0x0]` and the vertical concat literal `[a; b]` (where `a` is a tensor and `b` is a scalar/tensor) into a helper that allocates a fresh tensor and copies. Type unification at the loop join must understand that `tensor[0x0]` widens to `tensor[?x1]` once concat fires. | todo |
+| 11 concat_growth | Empty matrix literal `[]` already lowers as `tensor[0x0]` via the existing `TensorLiteral` path. The vertical concat `[base; value]` where `base` is a real tensor and `value` is a numeric scalar gets a new `VConcatGrow` JitExpr tag that codegens to `$h.vconcatGrow1r(base, value)` — a per-iter allocate-and-copy helper returning a fresh `(k+1, 1)` tensor. Type unification at the loop join widens `tensor[0x0]` against `tensor[?x1]` to `tensor[?x?]` element-wise; the fixed-point iterator in `lowerFor` stabilizes after one re-pass. | **done** |
 | 12 struct_field_read | Track struct types in the type env including their field types. Add a `tag: "MemberRead"` JitExpr (or extend Index) and lower scalar `s.f` reads as JS property loads. The struct must be created outside the loop (loop-invariant) so the field's runtime offset is stable. | todo |
 | 13 struct_array_chained | Add a `struct_array` JitType. Lower struct array indexing `s_array(i)` as a "row alias" (analogous to slice aliases) that doesn't materialize a Row struct. Chained `Member(Index(Member(T, nodes), [i]), chld)` substitutes through to a direct field-storage read at the leaf. | todo |
 | 14 struct ptloop target | Combines stages 09–13 on top of 04–07. Same shape as `flagnear_rectangle.m`. | todo |

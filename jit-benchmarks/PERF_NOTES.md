@@ -555,25 +555,110 @@ matlab** (178ms → 19ms) — about 26× faster than the IBuiltin path and
 ~9× faster than matlab. The full benchmark sweep showed no regressions
 in stages 1–9.
 
+## What was learned landing stage 11
+
+Stage 11 adds a small amount of IR + a runtime helper, wired through
+lowering/codegen in the minimum viable shape. About 100 lines across
+four files plus a 100-line correctness test. The design went in on the
+first try with no rework needed.
+
+- **Empty matrix literal `[]` already lowered correctly** as a
+  degenerate `TensorLiteral { rows: [], nRows: 0, nCols: 0 }` emitting
+  `$h.mkTensor([], [0, 0])`. The zero-row case was a no-op through the
+  existing row iteration loop, and `mkTensor` is happy with a
+  zero-length FloatXArray. No changes needed for `[]` itself.
+- **The bail was on the vconcat pattern**, not the empty literal. The
+  existing `case "Tensor"` row-element check rejects any
+  non-scalar element, so `[it; v]` where `it` is a tensor var fails
+  fast. A pattern match before the existing path catches exactly the
+  2-row-1-col tensor+scalar shape and synthesizes a new IR node.
+- **New IR tag `VConcatGrow { base, value }`**. Result type
+  `{ kind: "tensor", isComplex: false, shape: [-1, 1] }`. The `-1` in
+  shape[0] means "unknown length"; shape[1]=1 is statically known
+  because the helper always returns a column vector.
+- **Type unification drives convergence.** On the first body pass,
+  `it = []` gives `tensor[0x0]` and `it = [it; v]` gives `tensor[?x1]`.
+  `unifyJitTypes` maps these element-wise: shape[0] 0≠-1 → -1,
+  shape[1] 0≠1 → -1, so the merged type is `tensor[?x?]`. On the
+  second pass the vconcat base is `tensor[?x?]`, still lowers cleanly
+  (the lowering accepts any real tensor base and defers shape checks
+  to runtime), and the fixed point stabilizes after one re-pass.
+- **Runtime helper `vconcatGrow1r(base, v)`** accepts three base
+  shapes: empty (any dims, length 0), column vector `(k, 1)`, and
+  scalar `(1, 1)`. For empty, returns a fresh `(1, 1)` tensor with
+  just `v`. Otherwise allocates `new FloatXArray(baseLen + 1)`,
+  `.set(base.data)`, writes `v` at the tail, and wraps in a
+  `(baseLen+1, 1)` tensor via `makeTensor`. Throws on any other
+  shape (MATLAB-style dim mismatch). Per-iter allocation is
+  unavoidable for MATLAB growth semantics, but V8's young-gen
+  allocator is fast.
+- **The lowering accepts any real-tensor base**, not just
+  statically-known column vectors. This matters for the fixed point:
+  on the 2nd inner-loop pass the merged `it` has shape `[?, ?]`, which
+  can't be proven to be a column vector at type time, but the runtime
+  helper checks at dispatch and throws if the runtime shape is wrong.
+  Being permissive here is what lets the fixed point converge — a
+  stricter check would require a tri-state "column-vec-or-unknown"
+  flag on tensor JitTypes, which is more machinery than it's worth.
+- **The hoist pass's visitor needs a new case**, not to bump any
+  counts (VConcatGrow's base is emitted as a whole-tensor Var, not an
+  index read) but to recurse into `value` which may contain nested
+  index reads on other tensors. Without the case, `default: return;`
+  swallows the recursion and any tensor reads nested in `value` would
+  be missed by the hoist collection.
+- **`it` is a pure plain-Assign target**, never an `AssignIndex` or
+  `AssignIndexRange` target. The hoist pass correctly identifies this
+  (`maxWriteDim` stays 0), so `isWriteTarget` is false and no
+  `$h.unshare()` is emitted on the per-Assign refresh — which is
+  right, because `vconcatGrow1r` already returns a freshly-allocated
+  tensor with `_rc === 1`.
+- **`isempty(it)` and `length(it)` fall through to IBuiltin calls
+  (`$h.ib_isempty(it)` / `$h.ib_length(it)`)**. Their `jitEmit`
+  fast-paths only inline for scalar types. For tensors, the helper
+  just reads `v.data.length` at runtime — cheap enough, and these
+  calls are outside the hot inner loop body for the chunkie pattern.
+
+Generated JS (from the dumped stage 11 loop):
+
+```js
+it = $h.mkTensor([], [0, 0]);
+$it_data = it.data;
+$it_len = $it_data.length;
+for (var $t2 = 1; $t2 <= 5; $t2 += 1) {
+  j = $t2;
+  if (($h.mod((i + j), 3)) === (0)) {
+    it = $h.vconcatGrow1r(it, ((i * 10) + j));
+    $it_data = it.data;
+    $it_len = $it_data.length;
+  }
+}
+if (!(($h.ib_isempty(it)) !== 0)) {
+  totallen = (totallen + $h.ib_length(it));
+  totalsum = (totalsum + $h.idx1r_h($it_data, $it_len, 1));
+}
+```
+
+The hoist refresh after every `Assign` to `it` keeps `$it_data` /
+`$it_len` in sync with the freshly-allocated tensor, so the
+scalar-indexed `it(1)` read goes through the fast hoisted path.
+
+**Result**: stage 11 flipped from **BAIL** to **jit** at ratio ~1.93×
+matlab (105ms → 203ms). Per-iter allocation is the dominant cost —
+this is expected and matches the gotchas note's "~2× slower than the
+flat version but still well under matlab" prediction. If the ptloop
+ever needs this to be faster, the path is to rewrite the chunkie
+source to avoid growth (preallocate + index), which is what the
+flat-tensor stage 8 variant already demonstrates.
+
 ## Current branch state (for resuming after compaction)
 
-- numbl: stages 1–10 landed. Stage 10 at HEAD ("JIT: fold and/or/not
-  function-call form to operator form (stage 10)"). The numbl test is
-  `numbl_test_scripts/arithmetic/test_loop_and_or_not_func_form.m`.
-  Stage 9 at `c63e4f5`. All commits local, **not pushed**.
-- numbl-chunkie-benchmark: stage 10 docs at HEAD. Stages 11–14 still
+- numbl: stages 1–11 landed. Stage 11 at HEAD. The numbl test is
+  `numbl_test_scripts/indexing/test_loop_vconcat_grow.m`. All commits
+  local, **not pushed**.
+- numbl-chunkie-benchmark: stage 11 docs at HEAD. Stages 12–14 still
   in the WIP lineup (all BAIL).
 
-### Stages 11-14 gotchas (for planning ahead)
-
-- **Stage 11 (concat growth)**: Empty matrix literal `[]` has no
-  dimensions at lowering time. The shape tracker must widen
-  `tensor[0x0]` to `tensor[?x1]` at the first non-empty concat. The
-  fixed-point iterator in `lowerFor` drives this. New helper
-  `$h.vconcat_grow(t, v)` allocates a fresh `(k+1, 1)` tensor and
-  copies. Per-iter allocation is unavoidable for the growth semantics,
-  but V8's allocator is fast; expect ~2× slower than the flat version
-  but still well under matlab.
+### Stages 12-14 gotchas (for planning ahead)
 
 - **Stage 12 (struct field read)**: New `JitType.kind = "struct"` with
   a `fields: Record<string, JitType>` map. `lowerExpr` case `Member`
@@ -608,6 +693,7 @@ The numbl commits made so far for the loop JIT work, in order:
 - `7540ef6` JIT: add assert_jit_compiled() marker for staged JIT tests
 - `c63e4f5` JIT: range-slice write with whole-tensor source (**stage 9**)
 - `74ad9c1` JIT: fold and/or/not function-call form to operator form (**stage 10**)
+- `6c2bc6f` JIT: vertical concat growth `[t; v]` via VConcatGrow IR (**stage 11**)
 
 The benchmark commits:
 - `52ffa21` Add jit-benchmarks suite for staged loop-JIT improvements
