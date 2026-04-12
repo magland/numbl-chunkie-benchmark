@@ -650,13 +650,109 @@ ever needs this to be faster, the path is to rewrite the chunkie
 source to avoid growth (preallocate + index), which is what the
 flat-tensor stage 8 variant already demonstrates.
 
+## What was learned landing stage 12
+
+Stage 12 was almost as cheap as stage 10. About 200 lines across three
+files (one new IR tag, ~30 lines in lowering, ~110 lines in codegen
+for the collector + hoist emission + emitExpr case) plus a 90-line
+correctness test. The design went in on the first try.
+
+- **`JitType.kind = "struct"` with a `fields` map already existed**
+  and was already propagated by `inferJitType` (see
+  `builtins/types.ts:148`) — when a `RuntimeStruct` flows into a JIT
+  loop as a parameter, its fields are walked and each value's type
+  inferred recursively. `unifyJitTypes` already handled struct merging
+  field-by-field at loop joins. So all the *type* infrastructure was
+  in place before stage 12 — the only work was the expression lowering
+  and the codegen.
+- **The bail was entirely on the missing `case "Member":`** in
+  `lowerExpr`. Adding one that recognizes `Member(Ident(base), field)`
+  where the base's env type is a struct with a known numeric scalar
+  field, and emitting a new `MemberRead` IR node, was the whole
+  lowering change.
+- **New IR tag `MemberRead { baseName, fieldName, jitType }`** carries
+  the struct variable name and the field name directly rather than
+  nesting an inner `Var` JitExpr — the base is always a plain Ident
+  by construction, and flattening removes an unnecessary level of
+  indirection in both the hoist walker and the codegen emit.
+- **Codegen hoists each unique `(baseName, fieldName)` pair at
+  function entry** as `var $<base>_<field> = <base>.fields.get("<field>")`.
+  `_hoistedStructFields` maps the concatenated key
+  `"<baseName>.<fieldName>"` to the local alias name. On use,
+  `emitExpr` case `MemberRead` looks up the alias and emits the bare
+  identifier. A fallback path emits the Map lookup inline if the
+  alias isn't in the map, but this is dead code in practice — the
+  hoist walker and the emitter walk the same IR.
+- **`RuntimeStruct.fields` is a `Map<string, RuntimeValue>`**, not a
+  plain JS object (see `runtime/types.ts:139`). So `opts.k` at
+  runtime is `opts.fields.get("k")`, not a `.k` property load. This
+  is slightly slower per-access than a bare property load, but
+  because fields are hoisted to locals at function entry, the
+  `Map.get` cost is paid once per field per compile — the inner loop
+  only sees bare local reads.
+- **Class instances and getter methods were deliberately excluded.**
+  `JitType.kind = "class_instance"` has the same `fields` map layout,
+  but class fields may be dispatched through a user-defined `get.f()`
+  method that the simple `fields.get("f")` form would bypass.
+  Limiting stage 12 to plain structs avoids that hazard; class
+  instances remain a BAIL. The chunkie ptloop uses plain structs
+  (`opts`, `chnkr`), so this is sufficient for the ambitious target.
+- **Only numeric scalar fields (number/boolean/complex_or_number)
+  are accepted.** Tensor-typed struct fields would need per-field
+  hoisting of `.data`/`.length`/shape — different enough mechanism
+  that it belongs with stage 13's struct-array work.
+- **Loop-invariance is an *implicit* assumption**, not a hard check.
+  The codegen emits hoists at function entry — if the struct base is
+  reassigned mid-body, the hoisted aliases are stale. But the
+  lowering's type check saves us: after `opts = 5`, `ctx.env.get("opts")`
+  returns a number, not a struct, so subsequent `opts.k` lowers bail.
+  The hoisted aliases are only used for reads that lowered before
+  the reassignment — and those happen before the stale point, so
+  they see the pre-reassignment values correctly.
+- **Nested/chained Member access (`a.b.c`) was NOT added.** The base
+  must be a plain Ident. Extending to chained bases is mechanically
+  straightforward (recursively resolve the base type to pick up
+  `a.b` as a struct-typed sub-member) but stage 12 doesn't need it.
+  The chunkie ptloop uses single-level access (`chnkr.k`, `opts.rho`)
+  throughout the outer loop.
+
+Generated JS (from the dumped stage 12 loop):
+
+```js
+function $loop_for(n_iters, opts, total) {
+  var i, val;
+  var $opts_k = opts.fields.get("k");
+  var $opts_nch = opts.fields.get("nch");
+  var $opts_rho = opts.fields.get("rho");
+  var $opts_tol = opts.fields.get("tol");
+  for (var $t1 = 1; $t1 <= n_iters; $t1 += 1) {
+    i = $t1;
+    val = (($opts_k * i) + $opts_nch);
+    if ((val) > ($opts_tol)) {
+      total = (total + (val * $opts_rho));
+    }
+  }
+  return [i, total];
+}
+```
+
+Every field read in the hot loop is a bare local — the four
+`fields.get(...)` calls run once at entry and that's it.
+
+**Result**: stage 12 flipped from **BAIL** to **jit** at ratio ~0.08×
+matlab (203ms → 17ms) — about **12× faster than matlab**. This is in
+the same range as stage 10 (and-or fold), which was also "pure scalar
+arithmetic with a small fix-up". Stages 1–11 showed no regressions
+in the same sweep.
+
 ## Current branch state (for resuming after compaction)
 
-- numbl: stages 1–11 landed. Stage 11 at `6c2bc6f`. The numbl test is
-  `numbl_test_scripts/indexing/test_loop_vconcat_grow.m`. All commits
-  local, **not pushed**.
-- numbl-chunkie-benchmark: stage 11 docs at `9adcbbf`. Stages 12–14
-  still in the WIP lineup (all BAIL).
+- numbl: stages 1–12 landed. Stage 12 at `e7ba0f4`. The numbl test
+  for stage 12 is
+  `numbl_test_scripts/structs/test_loop_struct_field_read.m`. All
+  commits local, **not pushed**.
+- numbl-chunkie-benchmark: stage 12 docs at the commit below. Stages
+  13–14 still in the WIP lineup (all BAIL).
 
 ### Non-obvious details from landing stage 11 (don't relearn these)
 
@@ -700,48 +796,54 @@ flat-tensor stage 8 variant already demonstrates.
   registered in the export block at `jitHelpers.ts:702`. Both are
   needed — registering in only one place drops it from `$h`.
 
-### Stages 12-14 gotchas (for planning ahead)
+### Non-obvious details from landing stage 12 (don't relearn these)
 
-- **Stage 12 (struct field read)**: New `JitType.kind = "struct"`
-  *already exists* in `jitTypes.ts` with an optional
-  `fields?: Record<string, JitType>` map — unifyJitTypes already
-  handles merging two struct types field-by-field. What's missing:
-  - (a) **No `case "Member":` in `lowerExpr`** in `jitLower.ts` at
-    all — `Member` exprs currently fall through to the default `null`
-    return and the loop bails. Need to add a new case that looks up
-    the base's type, checks it's a struct with a known field, and
-    emits a new IR node for the scalar field read.
-  - (b) **No new runtime helper needed**, but codegen is subtle:
-    `RuntimeStruct.fields` is a **`Map<string, RuntimeValue>`**
-    (see `runtime/types.ts:139`), NOT a plain object. So `opts.k` at
-    runtime is `opts.fields.get("k")`, not `opts.k`. That's a slower
-    access than a JS property load, so the right move is to **hoist
-    each referenced scalar field at function entry** the same way
-    tensors hoist `.data`/`.length` — e.g. `var $opts_k =
-    opts.fields.get("k")` at the top, then every `opts.k` use in the
-    body becomes a bare `$opts_k` reference.
-  - (c) **The struct must be loop-invariant** (created outside and
-    never reassigned inside the loop). The hoist-at-entry pattern
-    only works if the runtime value doesn't change — mirrors the
-    restriction we already have for tensor writes. For scalar-only
-    field reads, the chunkie pattern (`opts.rho`, `chnkr.k`) is
-    always loop-invariant, so this is fine.
-  - (d) **New IR node**: `{ tag: "MemberRead"; base: JitExpr;
-    fieldName: string; jitType }`. Or extend `Index` — the existing
-    tag has `base` + `indices`, so a string "index" could work, but
-    it muddies the type. Cleaner to introduce `MemberRead` as a new
-    tag and keep the matching hoist alias map keyed on
-    `"${baseName}.${fieldName}"`.
-  - (e) **The loop analyzer already walks `expr.type === "Member"`**
-    correctly (`jitLoopAnalysis.ts:275`) — it adds the struct's base
-    Ident to `referenced`, so the struct becomes a JIT function
-    parameter automatically. No change needed there.
-  - (f) **Test placement**: use `numbl_test_scripts/struct/` (I saw
-    the directory name in `ls` output is plural "structs", not
-    "struct" — double-check before creating). Test multiple field
-    types (number, boolean) and verify against scalar-only refs.
-  - (g) **Only scalar fields** for stage 12. Tensor-typed fields and
-    struct-array chained access are stage 13.
+- **Struct JitType infra was already in place.** `inferJitType` at
+  `interpreter/builtins/types.ts:148` walks `RuntimeStruct.fields`
+  recursively and builds a `{ kind: "struct", fields }` type.
+  `unifyJitTypes` at `jitTypes.ts:231` already handled struct
+  merging field-by-field. The only gap was the expression lowering.
+- **The parser emits `{ type: "Member"; base: Expr; name: string }`**
+  (see `parser/types.ts:68`) — `name` is the field name directly,
+  not nested as an `Ident`. The lowering mirrors that shape.
+- **Lowering restriction: base must be a plain Ident.** Chained
+  member access (`a.b.c`) would require the lowering to recursively
+  resolve inner Member types, and that's stage 13 territory.
+- **Only numeric scalars accepted as field types.** The lowering
+  check uses `isNumericScalarType(fieldType)` which excludes strings,
+  chars, tensors, and other structs. Extending to tensor-typed
+  fields would need per-field `.data`/`.length`/shape hoisting —
+  different enough to belong with stage 13.
+- **The hoist pass does NOT need a refresh path** (unlike tensors).
+  Struct fields are hoisted at function entry only. If the struct
+  base is reassigned mid-body, the aliases are stale — but the
+  lowering's type check makes that safe. After `opts = 5`,
+  `ctx.env.get("opts")` returns a number, not a struct, so any
+  later `opts.f` lowering bails. The reads that successfully
+  lowered happened before the reassignment.
+- **Class instances deliberately excluded.** `class_instance` has
+  the same `fields: Map` layout but may have user-defined `get.f()`
+  methods that the simple `fields.get("f")` bypass. Limiting to
+  plain structs keeps stage 12 correct without a method-resolution
+  pass. The chunkie ptloop uses plain structs (`opts`, `chnkr`).
+- **Codegen hoist walker is separate from `collectTensorUsage`.**
+  New `collectStructFieldReads` walks the IR and builds a
+  `Map<"${base}.${field}", { baseName, fieldName }>`. Unique-key
+  dedup handles the "same field read many times" case for free.
+- **`_hoistedStructFields` map** tracks the alias identifier per
+  `(base, field)` pair. `emitExpr` case `MemberRead` looks up the
+  alias and emits the bare identifier. A fallback that emits
+  `base.fields.get("field")` inline exists but is dead code — the
+  hoist walker and the emitter walk the same IR.
+- **Struct params become JIT function parameters automatically.**
+  `jitLoopAnalysis.ts:275` already walks `case "Member":` by
+  recursing into `expr.base` — since the base is an `Ident`, it
+  gets added to `referenced`, and the loop input path picks up the
+  struct from the outer env. No analyzer change needed.
+- **Test placement**: `numbl_test_scripts/structs/` (plural — the
+  directory was already there with other struct tests).
+
+### Stages 13-14 gotchas (for planning ahead)
 
 - **Stage 13 (struct array chained)**: This is the big one. Need a
   new `struct_array` JitType. Lower `T.nodes(inode)` as a "row alias"
@@ -751,7 +853,8 @@ flat-tensor stage 8 variant already demonstrates.
   numbl's runtime stores struct arrays — likely as a per-field typed
   storage, in which case the read collapses to
   `T_nodes_chld.get(inode - 1)`. Check the runtime implementation
-  before designing the JitType.
+  before designing the JitType. Start with
+  `grep -rn "RuntimeStructArray\|struct_array" src/numbl-core/runtime/`.
 
 - **Stage 14 (full struct ptloop)**: Combines 9–13 on top of 1–8. No
   new capability, just the integration test. If 9–13 all land
@@ -771,6 +874,7 @@ The numbl commits made so far for the loop JIT work, in order:
 - `c63e4f5` JIT: range-slice write with whole-tensor source (**stage 9**)
 - `74ad9c1` JIT: fold and/or/not function-call form to operator form (**stage 10**)
 - `6c2bc6f` JIT: vertical concat growth `[t; v]` via VConcatGrow IR (**stage 11**)
+- `e7ba0f4` JIT: scalar struct field read via MemberRead IR (**stage 12**)
 
 The benchmark commits:
 - `52ffa21` Add jit-benchmarks suite for staged loop-JIT improvements
