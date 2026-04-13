@@ -56,7 +56,8 @@ jit-benchmarks/
     ├── stage_11_concat_growth.m
     ├── stage_12_struct_field_read.m
     ├── stage_13_struct_array_chained.m
-    └── stage_14_chunkie_ptloop_struct.m  ← struct-of-struct target
+    ├── stage_14_chunkie_ptloop_struct.m  ← struct-of-struct target
+    └── stage_19_func_handle_call.m      ← function handle call target
 ```
 
 Each stage is a self-contained `.m` script that prints `BENCH:` and
@@ -93,6 +94,7 @@ timings, ratios, JIT-fired count and check status.
 | 12 struct_field_read | scalar `s.f` read where `s` is a struct with known field types | `chnkr.k`, `chnkr.nch`, `opts.rho` |
 | 13 struct_array_chained | struct array indexing + chained Member: `T.nodes(i).chld` | the BVH children/xi access |
 | 14 **chunkie_ptloop_struct** | combines stages 9–13 on top of 1–8: a near-direct copy of `flagnear_rectangle`'s outer for loop in struct-of-struct form | the entire ptloop (struct-of-struct, matches chunkie source) |
+| 19 **func_handle_call** | function\_handle JIT type + FuncHandleCall IR + callFuncHandle helper with runtime return-type verification | `kern(srcinfo, targinfo)` in `adapgausskerneval` — the kernel function passed as a handle |
 
 ## Progress
 
@@ -115,8 +117,9 @@ per-stage details and the V8 findings behind the improvements.
 | stage_12_struct_field_read    | 203ms |    —   |   17ms |  0.08x | jit |
 | stage_13_struct_array_chained | 155ms |    —   |   10ms |  0.07x | jit |
 | stage_14_chunkie_ptloop_struct| 233ms |    —   |  118ms |  0.51x | jit |
+| stage_19_func_handle_call    |  10ms |    —   |   35ms |  3.54x | jit |
 
-**Stages 1–14 are all JIT'ing.** Stages 4–6, 8, 9, 10, 12, 13, 14 beat
+**Stages 1–14 and 19 are all JIT'ing.** Stages 4–6, 8, 9, 10, 12, 13, 14 beat
 or match matlab (ratio ≤ 1×); stage 13 by ~15× and stage 12 by ~12×;
 stage 10 by ~9×; stages 5 and 9 by ~3.5×. Stage 8, the flat-tensor BVH
 walker, runs ~2× faster than matlab. Stage 11 lands at ~1.9× matlab
@@ -156,6 +159,7 @@ alias" sketch that preceded it).
 | 12 struct_field_read | Struct types were already tracked in the type env (`JitType.kind = "struct"` with `fields` map, propagated through `inferJitType`). Added a new `MemberRead` JitExpr tag. `lowerExpr` case `"Member"` recognizes `Ident(base).field` where base has a struct type with a known scalar numeric field and emits a `MemberRead`. Codegen walks the IR collecting unique `(baseName, fieldName)` pairs and hoists each as `var $base_field = base.fields.get("field")` at function entry, so per-iter reads are bare local loads. `RuntimeStruct.fields` is a `Map<string, RuntimeValue>` — hoisting amortizes the one-time `Map.get` cost across the whole loop. | **done** |
 | 13 struct_array_chained | Add a `struct_array` JitType kind (with per-field `elemFields` inferred from runtime). Infer struct_array only for nested (struct-field) position to keep existing builtin dispatch unchanged. Recognize the parser shape `Member(MethodCall(Ident(T), "nodes", [i]), "leaf")` in `lowerExpr` and emit a new `StructArrayMemberRead` IR node. Codegen hoists `$T_nodes_elements = T.fields.get("nodes").elements` once per unique `(structVar, field)` pair; per-use reads do `$T_nodes_elements[Math.round(i) - 1].fields.get("leaf")`. Tensor-typed leaves reuse stage 6's existing per-Assign hoist refresh. Also fixes two pre-existing bugs that stage 13 surfaced: removing `lowerFunction`'s `number=0` output pre-init (which poisoned tensor outputs at loop joins) and promoting outputs-in-outer-env to loop-function inputs (so write-only locals survive zero-iter loops). | **done** |
 | 14 struct ptloop target | Combines stages 09–13 on top of 04–07. Same shape as `flagnear_rectangle.m`. JITs as one loop function with one helper loop for the rect-init pre-loop — no new capability needed beyond stage 13. | **done** |
+| 19 func_handle_call | Add `function_handle` to `JitType` union. In `lowerExpr` case `"FuncCall"`, detect when a variable has type `function_handle` and emit a new `FuncHandleCall` IR node instead of treating it as indexing. Return type is determined by **probing**: calling the function handle once at JIT compile time with representative argument values (actual env values for existing variables, synthesized values for loop iterators). Codegen emits `$h.callFuncHandle($rt, fn, expectedType, ...args)`. The helper verifies the actual return type at runtime on every call — on mismatch, throws `JitFuncHandleBailError` which `executeAndWriteBack` catches, warns, invalidates the cache entry, and returns `false` so the interpreter re-runs the loop. | **done** |
 
 Each capability lands in numbl together with a correctness test in
 `~/src/numbl/numbl_test_scripts/` (typically `indexing/` for slice
