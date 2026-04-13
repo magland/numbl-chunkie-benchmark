@@ -22,7 +22,8 @@ chnkrcirc = reverse(chnkrcirc);
 
 % reduced set: 4 inner circles instead of 10
 centers = [[-1, 0, 1, 0]; [0.5, -0.5, 0.5, -0.5]];
-centers = centers + 0.1*randn(size(centers));
+% fixed perturbation (no rand) so matlab/numbl results are comparable
+centers = centers + 0.1*[0.0347, -0.0518, 0.1274, -0.0893; 0.0672, -0.1135, 0.0409, -0.0261];
 
 chnkrlist = [chnkrouter];
 for j = 1:size(centers,2)
