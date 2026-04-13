@@ -980,14 +980,14 @@ storage caching where a struct array's columns are flattened to
 typed arrays at JIT compile time (an optimization-only change, no
 semantics risk). Both are deferred.
 
-## Current branch state (stage 13 landed)
+## Current branch state (stage 13 + chunkie flagnear JIT)
 
-- **numbl**: stages 1–14 JIT cleanly. Stage 13 commit at the hash
-  below. The stage 13 correctness test is
-  `numbl_test_scripts/structs/test_loop_struct_array_chained.m`. All
-  commits local, **not pushed**.
-- **numbl-chunkie-benchmark**: stage 13 + 14 both reporting `jit` in
-  the sweep. Docs updated in this commit.
+- **numbl**: stages 1–14 JIT cleanly. Follow-up `771c13d` fixes the
+  real chunkie `flagnear_rectangle.m` JIT. The numbl test for stage 13
+  is `numbl_test_scripts/structs/test_loop_struct_array_chained.m`.
+  644/644 tests pass. All commits local, **not pushed**.
+- **numbl-chunkie-benchmark**: ex01 interior 6.2×→1.9× matlab. Report
+  updated.
 
 ### Non-obvious details from landing stage 13 (don't relearn these)
 
@@ -1052,13 +1052,30 @@ semantics risk). Both are deferred.
   flattening fields to typed arrays at compile time (an optimization
   pass) or by switching RuntimeStruct's field storage to plain objects
   (a ripple-effect change across the runtime). Both are deferred.
-- **The actual chunkie `flagnear_rectangle.m`** should now JIT too.
-  Next step after committing stage 13: point numbl at the chunkie
-  benchmark (ex01 Helmholtz starfish) and see whether the interior
-  phase is faster than matlab. If the numbl side still bails, the
-  diff between stage 14 and `flagnear_rectangle` is the thing to
-  investigate — probably a chunkie construct stage 14 doesn't
-  exercise.
+- **The actual chunkie `flagnear_rectangle.m` now JITs** after two
+  follow-up fixes in `771c13d`:
+  1. **Mixed tensor/scalar struct array fields**: chunkie's `hypoct`
+     stores single-element vector fields as bare numbers (e.g.
+     `T.nodes(i).xi = 87`). `unifyStructArrayFieldTypes` widens
+     mixed real-tensor + numeric-scalar to `tensor` (no shape) instead
+     of `unknown`. Codegen wraps tensor-leaf reads in `$h.asTensor()`
+     which promotes numbers to 1x1 RuntimeTensors at runtime.
+  2. **Slice alias shape relaxation**: `tryLowerAsSliceBind` used to
+     require ALL shape dimensions to be statically known. After
+     progressive type widening, `pts:tensor[2x?]` has an unknown
+     column count, bailing `pt = pts(:, i)`. Relaxed to only require
+     known sizes for colon dimensions (which need a static size for
+     alias substitution); scalar-index dimensions are runtime-checked.
+  Together these bring ex01 interior from 1.78s (6.2× matlab) to
+  **0.68s (1.9× matlab)**, a 2.6× improvement. Eval from 13.8s
+  (15.6×) to 6.0s (7.4×). Total execution from 22.2s (4.8×) to
+  13.5s (2.6×).
+- **The remaining eval-phase gap** (7.4× vs interior's 1.9×) is
+  because `chunkerkerneval` calls `flagnear_rectangle` with many
+  different `pts` shapes, each triggering a new JIT recompilation.
+  Progressive type widening eventually stabilizes to `tensor[2x?]`,
+  but the first few calls per shape pay full compilation cost. The
+  eval path also has other non-flagnear loops that aren't JIT'd yet.
 
 The numbl commits made so far for the loop JIT work, in order:
 - `34d107a` Fix --dump-js double-printing JIT compilations
@@ -1075,6 +1092,7 @@ The numbl commits made so far for the loop JIT work, in order:
 - `6c2bc6f` JIT: vertical concat growth `[t; v]` via VConcatGrow IR (**stage 11**)
 - `e7ba0f4` JIT: scalar struct field read via MemberRead IR (**stage 12**)
 - `a9714b0` JIT: chained struct array member read via StructArrayMemberRead IR (**stage 13 + stage 14 integration**)
+- `771c13d` JIT: handle mixed tensor/scalar struct array fields + relax slice alias shape check (**flagnear_rectangle JITs**)
 
 The benchmark commits:
 - `52ffa21` Add jit-benchmarks suite for staged loop-JIT improvements
