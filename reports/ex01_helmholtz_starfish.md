@@ -13,27 +13,27 @@
 | memory | 41.9 GB |
 | node | v24.14.1 |
 | matlab | R2025b |
-| numbl | v0.1.6 @ [`a9714b0-dirty`](https://github.com/flatironinstitute/numbl/commit/a9714b0) |
+| numbl | v0.1.6 @ [`9196971-dirty`](https://github.com/flatironinstitute/numbl/commit/9196971) |
 
 ## Timing summary
 
 | metric | matlab | numbl | ratio (nb/ml) |
 | --- | --- | --- | --- |
-| startup | 3.465s | 964ms | 0.28x |
-| execution | 5.199s | 13.50s | 2.60x |
+| startup | 3.416s | 1.064s | 0.31x |
+| execution | 4.610s | 10.39s | 2.25x |
 
-Chunkie install time is excluded from both rows above (matlab: 2.336s, numbl: 702ms).
+Chunkie install time is excluded from both rows above (matlab: 2.543s, numbl: 774ms).
 
 ## Phase timings
 
 | phase | matlab | numbl | ratio (nb/ml) |
 | --- | --- | --- | --- |
-| discretize | 126ms | 422ms | 3.35x |
-| build_matrix | 3.495s | 5.987s | 1.71x |
-| solve | 298ms | 343ms | 1.15x |
-| interior | 357ms | 677ms | 1.90x |
-| eval | 813ms | 6.036s | 7.42x |
-| **sum** | 5.089s | 13.46s | 2.65x |
+| discretize | 91ms | 455ms | 4.99x |
+| build_matrix | 3.094s | 6.139s | 1.98x |
+| solve | 276ms | 417ms | 1.51x |
+| interior | 292ms | 720ms | 2.46x |
+| eval | 750ms | 2.624s | 3.50x |
+| **sum** | 4.504s | 10.36s | 2.30x |
 
 ## Result checks
 
