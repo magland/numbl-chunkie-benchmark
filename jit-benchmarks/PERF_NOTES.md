@@ -1249,6 +1249,85 @@ unchanged. The win of these stages is **correctness + capability
 unlock**, not raw benchmark perf. Follow-up work (especially soft-
 bail) should show the impact.
 
+## What was learned landing stage 24 (soft-bail UserCall)
+
+Stage 24 addresses the core pattern noted in the stages-17/21/22
+learnings: when an enclosing loop is JIT-friendly but the user
+function it calls has a body the JIT can't lower (tensor arithmetic,
+matrix multiply, bsxfun with function-handle args), the old behavior
+was to return null from `lowerUserFuncCall` and bail the whole outer
+loop. Stage 24 splits that into two paths:
+
+  - **Hard bail** (unchanged): callee can't lower AND uses a
+    caller-aware builtin (`evalin`, `assignin`, `inputname`,
+    `dbstack`, `keyboard`, `input`). These resolve against the
+    MATLAB call stack at runtime, and can't be probed at JIT compile
+    time — a probe call would run with a different stack than the
+    actual runtime call, producing wrong results.
+  - **Soft bail** (new): callee can't lower but has no caller-aware
+    builtin references. Probe the return type by invoking the
+    function once via `rt.dispatch` with representative arg values,
+    then emit a `UserDispatchCall` IR node that codegens to
+    `$h.callUserFunc($rt, name, expectedType, ...args)`. The helper
+    dispatches through the interpreter at runtime with full
+    call-frame + cleanup management, and verifies the return type
+    tag on every call — mismatch throws `JitFuncHandleBailError`
+    (same failure mode as stage 19's callFuncHandle).
+
+The caller-aware guard was added defensively after the first
+attempt broke `numbl_test_scripts/builtins/assignin_evalin.m` —
+specifically `evalin('caller', 'q', 999)` inside a user function
+returned 999 instead of the caller's actual `q=7`. Because the
+probe call ran with no `q` in scope, the probed return type was
+`number=999`; at runtime, the callUserFunc path didn't reproduce
+the interpreter's caller-frame setup exactly enough to recover
+the correct `q` from evalin. Rather than fix the caller-frame
+semantics (messy; subject to ongoing evolution), we now simply
+skip soft-bail for callees that touch these builtins — correctness
+preserved, and this excludes a narrow set of functions that
+almost never appear in hot JIT loops anyway.
+
+### Verification
+
+  - **Stage 24 bench**: `stage_24_soft_bail_user_call.m` lands at
+    **0.13× matlab** (21ms vs 169ms). The callee is
+    `bsxfun(@times, A, s)` which the JIT doesn't lower; the outer
+    loop with the scalar total accumulator JITs cleanly.
+  - **Correctness test**: `numbl_test_scripts/functions/
+    test_loop_soft_bail_user_call.m` exercises scalar-return,
+    tensor-return, AND an evalin case (which must NOT soft-bail).
+  - **Full test suite**: 652/652 pass (up from 651 with the new
+    test).
+
+### Why ex02 didn't collapse
+
+Stage 24 alone does not fix ex02's eval gap. The `adapgausskerneval.m:109`
+inner loop has OTHER bail reasons besides the `oneintp` UserCall:
+
+  - `fint1 = 0; for ...; fint1 = fint1 + v2 + v3; end` — the
+    number-to-tensor type transition at the loop join bails
+    lowerFor (type unification number ∧ tensor → unknown).
+  - `max(abs(v2+v3-vals(:,jj)))` — tensor arithmetic +
+    single-arg `max` reduction on a tensor not yet JIT-lowered.
+
+So the inner loop still bails, and soft-bail is never reached. The
+architectural lever is still present and correct though — any future
+work that unblocks the outer loop will benefit from soft-bail for
+free via the oneintp/lege.exev call sites.
+
+### Minimal changes
+
+  - `jitTypes.ts`: new `UserDispatchCall` JitExpr tag.
+  - `jitLower.ts`: split `if (!calleeResult) return null;` into the
+    two branches (guard + probe + emit). New
+    `callerAwareBuiltinInBody` walker (~100 lines). New
+    `probeUserFuncReturnType` that dispatches via `rt.dispatch`.
+  - `jitHelpers.ts`: new `callUserFunc` helper (mirrors the slow
+    path of `callFuncHandle`; full frame + cleanup dance).
+  - `jitCodegen.ts`: new emit case + `emitUserDispatchCall`.
+  - `jitCodegenHoist.ts`: include `UserDispatchCall` in the
+    recurse-into-args case alongside `UserCall` / `FuncHandleCall`.
+
 ## Cheat sheet for the next session
 
 - The fastest way to find a perf bug: dump the JIT JS, paste it into a

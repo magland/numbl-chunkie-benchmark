@@ -61,7 +61,9 @@ jit-benchmarks/
     ├── stage_19_func_handle_call.m      ← function handle call target
     ├── stage_21_range_slice_read.m      ← range slice read on RHS (ex02 driver)
     ├── stage_22_struct_field_assign.m   ← struct field lvalue (ex02 driver)
-    └── stage_23_adap_inner.m            ← adapgausskerneval inner-loop target
+    ├── stage_23_adap_inner.m            ← adapgausskerneval inner-loop target
+    ├── stage_24_soft_bail_user_call.m   ← soft-bail UserCall → dispatch
+    └── stage24_helper_bsxfun.m          ← (callee helper for stage 24)
 ```
 
 Stages 17 / 21 / 22 / 23 target the remaining capability gaps that
@@ -111,6 +113,7 @@ timings, ratios, JIT-fired count and check status.
 | 21 range_slice_read | range slice read on RHS `x = t(a:b)` (either materialize via `subarrayCopy1r` helper, or extend stage 5 alias to Range indices) | `r0 = all0(1:dim)`, `d0 = all0(dim+1:2*dim)` in `chnk.chunk_nearparam` Newton iteration |
 | 22 struct_field_assign | Member lvalue `s.f = v` — new `AssignMember` IR + `structSetField_h` helper, plus empty→struct promotion for `s = []; s.f = ...` | `srcinfo.r = rint; srcinfo.d = dint; ...` in adapgausskerneval's `oneintp` |
 | 23 **adap_inner** | integration target: the adapgausskerneval inner subdivision loop combining stages 17 + 19 (direct handle form). Full oneintp inlining additionally needs stages 21 + 22 | `chnk.adapgausskerneval.m:109-160` — dominates ex02 eval_vel + eval_pres |
+| 24 **soft_bail_user_call** | when `lowerUserFuncCall` can't lower a callee's body (tensor arith, matrix multiply, bsxfun with handle arg, …), probe the return type once at JIT compile time and emit a `UserDispatchCall` that goes through `rt.dispatch` at runtime — outer loop still JITs. Skips callees that use caller-aware builtins (evalin/assignin/dbstack/…) where probing isn't safe. | `oneintp(...)`, `lege.exev(...)` — any user-function-in-a-loop pattern where the outer loop is JIT-friendly |
 
 ## Progress
 
@@ -138,6 +141,7 @@ per-stage details and the V8 findings behind the improvements.
 | stage_21_range_slice_read    | 197ms |    —   |  312ms |  1.59x | jit |
 | stage_22_struct_field_assign | 126ms |    —   |   23ms |  0.18x | jit |
 | stage_23_adap_inner          | 634ms |    —   |  37.03s| 58.39x | jit |
+| stage_24_soft_bail_user_call | 169ms |    —   |   21ms |  0.13x | jit |
 
 Stage 23 JITs (the inner subdivision loop compiles as one loop fn),
 but the ambitious ~1× matlab target is still distant: the anonymous
@@ -194,6 +198,7 @@ alias" sketch that preceded it).
 | 21 range_slice_read | In `lowerExpr` Index/FuncCall paths, recognize single-index Range on a real-tensor base and emit a new `RangeSliceRead` JitExpr. `end` keyword as the upper bound is special-cased to substitute the hoisted `.data.length` alias in codegen. Helper `subarrayCopy1r(srcData, srcLen, a, b)` allocates a fresh `(b-a+1, 1)` tensor via `makeTensor`. Alloc-per-iter is unavoidable without extending stage 5's slice-alias to Range indices; small slices are cheap in V8 young-gen. | **done** |
 | 22 struct_field_assign | New IR `AssignMember { baseName, fieldName, value, needsPromote }`. In `lowerAssignLValue` add a `case "Member"` branch. Three base cases: (a) struct in env → mutate via `s.fields.set`; (b) `s = []` idiom or (c) write-only local → `needsPromote=true` emits `s = $h.structNew_h()` first. Plus: `$h.structUnshare_h(s)` clone-on-entry for any struct PARAM that is an `AssignMember` target, preserving MATLAB value semantics (caller unaffected by callee mutations). Stage 12 hoist refined to skip when the base is reassigned or member-written inside the body. | **done** |
 | 23 adap_inner target | Combines stages 17 + 19 on top of 1–8. Inner loop JITs as one function. Full ambitious `oneintp` + adap inner lowering additionally needs (a) tensor arithmetic (matrix multiply, tensor-builtin calls with tensor returns) and (b) soft-bail UserCall→interpreter fallback so the outer loop JITs even when the callee doesn't fully lower. | **partial** (inner JIT fires; callee still interpreted) |
+| 24 soft_bail_user_call | In `lowerUserFuncCall`, when the recursive `lowerFunction` call fails, probe the callee's return type via `rt.dispatch` with representative args and emit a new `UserDispatchCall` JitExpr instead of returning null. Codegen emits `$h.callUserFunc($rt, name, expectedType, …args)` with runtime return-type verification (reuses the `JitFuncHandleBailError` path). Pre-probe guard: walks the callee body AST looking for `evalin`/`assignin`/`dbstack`/`inputname`/`keyboard`/`input` — if any are present, skip the soft-bail and fall through to hard-bail (those builtins are caller-frame-sensitive and can't be probed at JIT compile time). | **done** |
 
 Each capability lands in numbl together with a correctness test in
 `~/src/numbl/numbl_test_scripts/` (typically `indexing/` for slice
