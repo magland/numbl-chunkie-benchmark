@@ -57,8 +57,20 @@ jit-benchmarks/
     ├── stage_12_struct_field_read.m
     ├── stage_13_struct_array_chained.m
     ├── stage_14_chunkie_ptloop_struct.m  ← struct-of-struct target
-    └── stage_19_func_handle_call.m      ← function handle call target
+    ├── stage_17_col_slice_write.m       ← multi-dim col slice write (ex02 driver)
+    ├── stage_19_func_handle_call.m      ← function handle call target
+    ├── stage_21_range_slice_read.m      ← range slice read on RHS (ex02 driver)
+    ├── stage_22_struct_field_assign.m   ← struct field lvalue (ex02 driver)
+    └── stage_23_adap_inner.m            ← adapgausskerneval inner-loop target
 ```
+
+Stages 17 / 21 / 22 / 23 target the remaining capability gaps that
+make the Stokes benchmark ([reports/ex02_stokes_peanut.md](../reports/ex02_stokes_peanut.md))
+run ~7.8× slower than matlab. Per the `forcesmooth` experiment, the
+whole ~12s eval-phase gap is in chunkie's adaptive-quadrature path —
+specifically the `chnk.adapgausskerneval.m` inner subdivision loop at
+line 109 plus the `oneintp` helper it calls. Stage 23 is the
+integration target mirroring that loop.
 
 Each stage is a self-contained `.m` script that prints `BENCH:` and
 `CHECK:` lines so the runner can compare timings and verify
@@ -94,7 +106,11 @@ timings, ratios, JIT-fired count and check status.
 | 12 struct_field_read | scalar `s.f` read where `s` is a struct with known field types | `chnkr.k`, `chnkr.nch`, `opts.rho` |
 | 13 struct_array_chained | struct array indexing + chained Member: `T.nodes(i).chld` | the BVH children/xi access |
 | 14 **chunkie_ptloop_struct** | combines stages 9–13 on top of 1–8: a near-direct copy of `flagnear_rectangle`'s outer for loop in struct-of-struct form | the entire ptloop (struct-of-struct, matches chunkie source) |
+| 17 **col_slice_write** | multi-dim column slice write `dst(:, j) = src_tensor` via new `AssignIndexCol` IR + `setCol2r_h` helper | `vals(:, jj+1) = v2` in adapgausskerneval |
 | 19 **func_handle_call** | function\_handle JIT type + FuncHandleCall IR + callFuncHandle helper with runtime return-type verification | `kern(srcinfo, targinfo)` in `adapgausskerneval` — the kernel function passed as a handle |
+| 21 range_slice_read | range slice read on RHS `x = t(a:b)` (either materialize via `subarrayCopy1r` helper, or extend stage 5 alias to Range indices) | `r0 = all0(1:dim)`, `d0 = all0(dim+1:2*dim)` in `chnk.chunk_nearparam` Newton iteration |
+| 22 struct_field_assign | Member lvalue `s.f = v` — new `AssignMember` IR + `structSetField_h` helper, plus empty→struct promotion for `s = []; s.f = ...` | `srcinfo.r = rint; srcinfo.d = dint; ...` in adapgausskerneval's `oneintp` |
+| 23 **adap_inner** | integration target: the adapgausskerneval inner subdivision loop combining stages 17 + 19 (direct handle form). Full oneintp inlining additionally needs stages 21 + 22 | `chnk.adapgausskerneval.m:109-160` — dominates ex02 eval_vel + eval_pres |
 
 ## Progress
 
@@ -117,7 +133,21 @@ per-stage details and the V8 findings behind the improvements.
 | stage_12_struct_field_read    | 203ms |    —   |   17ms |  0.08x | jit |
 | stage_13_struct_array_chained | 155ms |    —   |   10ms |  0.07x | jit |
 | stage_14_chunkie_ptloop_struct| 233ms |    —   |  118ms |  0.51x | jit |
-| stage_19_func_handle_call    |  10ms |    —   |   35ms |  3.54x | jit |
+| stage_19_func_handle_call    |  10ms |    —   |   38ms |  3.58x | jit |
+| stage_17_col_slice_write     | 124ms |    —   |  107ms |  0.86x | jit |
+| stage_21_range_slice_read    | 197ms |    —   |  312ms |  1.59x | jit |
+| stage_22_struct_field_assign | 126ms |    —   |   23ms |  0.18x | jit |
+| stage_23_adap_inner          | 634ms |    —   |  37.03s| 58.39x | jit |
+
+Stage 23 JITs (the inner subdivision loop compiles as one loop fn),
+but the ambitious ~1× matlab target is still distant: the anonymous
+function-handle body runs in the interpreter, allocating a 2×1 tensor
+per call. The chunkie version uses `kern.eval` (a bound method with a
+jsFn closure) which is faster per-call than an anonymous lambda.
+Narrowing the ratio further for this shape needs either:
+  - soft-bail UserCall → interpreter dispatch fallback (keeps outer
+    loop JIT'd even when the callee can't fully lower), or
+  - deep tensor-arith lowering so `oneintp` itself JITs.
 
 **Stages 1–14 and 19 are all JIT'ing.** Stages 4–6, 8, 9, 10, 12, 13, 14 beat
 or match matlab (ratio ≤ 1×); stage 13 by ~15× and stage 12 by ~12×;
@@ -160,6 +190,10 @@ alias" sketch that preceded it).
 | 13 struct_array_chained | Add a `struct_array` JitType kind (with per-field `elemFields` inferred from runtime). Infer struct_array only for nested (struct-field) position to keep existing builtin dispatch unchanged. Recognize the parser shape `Member(MethodCall(Ident(T), "nodes", [i]), "leaf")` in `lowerExpr` and emit a new `StructArrayMemberRead` IR node. Codegen hoists `$T_nodes_elements = T.fields.get("nodes").elements` once per unique `(structVar, field)` pair; per-use reads do `$T_nodes_elements[Math.round(i) - 1].fields.get("leaf")`. Tensor-typed leaves reuse stage 6's existing per-Assign hoist refresh. Also fixes two pre-existing bugs that stage 13 surfaced: removing `lowerFunction`'s `number=0` output pre-init (which poisoned tensor outputs at loop joins) and promoting outputs-in-outer-env to loop-function inputs (so write-only locals survive zero-iter loops). | **done** |
 | 14 struct ptloop target | Combines stages 09–13 on top of 04–07. Same shape as `flagnear_rectangle.m`. JITs as one loop function with one helper loop for the rect-init pre-loop — no new capability needed beyond stage 13. | **done** |
 | 19 func_handle_call | Add `function_handle` to `JitType` union. In `lowerExpr` case `"FuncCall"`, detect when a variable has type `function_handle` and emit a new `FuncHandleCall` IR node instead of treating it as indexing. Return type is determined by **probing**: calling the function handle once at JIT compile time with representative argument values (actual env values for existing variables, synthesized values for loop iterators). Codegen emits `$h.callFuncHandle($rt, fn, expectedType, ...args)`. The helper verifies the actual return type at runtime on every call — on mismatch, throws `JitFuncHandleBailError` which `executeAndWriteBack` catches, warns, invalidates the cache entry, and returns `false` so the interpreter re-runs the loop. | **done** |
+| 17 col_slice_write | New IR `AssignIndexCol { baseName, colIndex, srcBaseName }` for the shape `Index(Ident(dst), [Colon, scalar_j]) = Ident(src_tensor)` where both are real tensors and dst has statically-known 2-D shape. `tryLowerColAssign` pattern-matches in `lowerAssignLValue` before falling through to the range-assign path. New helper `setCol2r_h(dstData, dstRows, dstLen, col, srcData, srcLen)` bounds-checks j and calls `dstData.set(srcData.subarray(0, dstRows), (j-1)*dstRows)`. | **done** |
+| 21 range_slice_read | In `lowerExpr` Index/FuncCall paths, recognize single-index Range on a real-tensor base and emit a new `RangeSliceRead` JitExpr. `end` keyword as the upper bound is special-cased to substitute the hoisted `.data.length` alias in codegen. Helper `subarrayCopy1r(srcData, srcLen, a, b)` allocates a fresh `(b-a+1, 1)` tensor via `makeTensor`. Alloc-per-iter is unavoidable without extending stage 5's slice-alias to Range indices; small slices are cheap in V8 young-gen. | **done** |
+| 22 struct_field_assign | New IR `AssignMember { baseName, fieldName, value, needsPromote }`. In `lowerAssignLValue` add a `case "Member"` branch. Three base cases: (a) struct in env → mutate via `s.fields.set`; (b) `s = []` idiom or (c) write-only local → `needsPromote=true` emits `s = $h.structNew_h()` first. Plus: `$h.structUnshare_h(s)` clone-on-entry for any struct PARAM that is an `AssignMember` target, preserving MATLAB value semantics (caller unaffected by callee mutations). Stage 12 hoist refined to skip when the base is reassigned or member-written inside the body. | **done** |
+| 23 adap_inner target | Combines stages 17 + 19 on top of 1–8. Inner loop JITs as one function. Full ambitious `oneintp` + adap inner lowering additionally needs (a) tensor arithmetic (matrix multiply, tensor-builtin calls with tensor returns) and (b) soft-bail UserCall→interpreter fallback so the outer loop JITs even when the callee doesn't fully lower. | **partial** (inner JIT fires; callee still interpreted) |
 
 Each capability lands in numbl together with a correctness test in
 `~/src/numbl/numbl_test_scripts/` (typically `indexing/` for slice
@@ -173,9 +207,10 @@ and confirm the ratio collapses.
 - **`length()` / `isempty()` on tensors inside the JIT.** Already
   supported, just not inlined as cleanly as for scalars. Improving the
   inline form is incremental polish.
-- **Multi-dim slice writes** like `dst(:, j) = src(:, k)`. Stage 6 only
-  handles linear `dst(a:b) = src(c:d)`; multi-dim shapes aren't needed
-  for the chunkie ptloop.
+- **Multi-dim slice writes from a range-slice source** like
+  `dst(:, j) = src(:, k)` in one statement. Stage 17 handles the
+  `dst(:, j) = src_tensor` form used by adapgausskerneval/chunkerinterior,
+  but a two-colon multi-dim variant isn't needed for the eval path.
 - **Stepped ranges** in slice writes (`dst(a:2:b) = ...`).
 - **Slice writes from a scalar fill** (`dst(a:b) = 5`).
 - **Complex-tensor variants** of any of the above.

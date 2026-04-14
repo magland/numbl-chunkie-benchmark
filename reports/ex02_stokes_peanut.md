@@ -1,7 +1,7 @@
 # Benchmark: ex02_stokes_peanut
 
 - **Script:** `benchmarks/ex02_stokes_peanut.m`
-- **Date:** 2026-04-13
+- **Date:** 2026-04-14
 - **Relative tolerance:** `1e-8`
 
 ## Environment
@@ -13,40 +13,40 @@
 | memory | 41.9 GB |
 | node | v24.14.1 |
 | matlab | R2025b |
-| numbl | v0.1.7 @ [`c9a419e`](https://github.com/flatironinstitute/numbl/commit/c9a419e) |
+| numbl | v0.1.7 @ [`f14e698-dirty`](https://github.com/flatironinstitute/numbl/commit/f14e698) |
 
 ## Timing summary
 
 | metric | matlab | numbl | ratio (nb/ml) |
 | --- | --- | --- | --- |
-| startup | 3.936s | 1.132s | 0.29x |
-| execution | 2.299s | 14.28s | 6.21x |
+| startup | 3.890s | 1.053s | 0.27x |
+| execution | 1.593s | 13.29s | 8.34x |
 
-Chunkie install time is excluded from both rows above (matlab: 2.666s, numbl: 855ms).
+Chunkie install time is excluded from both rows above (matlab: 2.526s, numbl: 780ms).
 
 ## Phase timings
 
 | phase | matlab | numbl | ratio (nb/ml) |
 | --- | --- | --- | --- |
-| discretize | 290ms | 165ms | 0.57x |
-| build_matrix | 127ms | 406ms | 3.19x |
-| solve | 37ms | 11ms | 0.31x |
-| interior | 308ms | 993ms | 3.23x |
-| eval_vel | 1.197s | 7.623s | 6.37x |
-| eval_pres | 337ms | 5.077s | 15.05x |
-| **sum** | 2.296s | 14.27s | 6.22x |
+| discretize | 242ms | 161ms | 0.67x |
+| build_matrix | 127ms | 388ms | 3.06x |
+| solve | 40ms | 14ms | 0.36x |
+| interior | 194ms | 985ms | 5.07x |
+| eval_vel | 647ms | 6.935s | 10.72x |
+| eval_pres | 340ms | 4.797s | 14.10x |
+| **sum** | 1.590s | 13.28s | 8.35x |
 
 ## Result checks
 
 | name | matlab | numbl | rel_diff | status |
 | --- | --- | --- | --- | --- |
 | chnkr_npt | 3.8400000000e+2 | 3.8400000000e+2 | 0.00e+0 | ok |
-| num_interior | 2.1110000000e+3 | 2.1190000000e+3 | 3.78e-3 | **MISMATCH** |
-| pres_norm | 1.7528633505e+2 | 3.4858140880e+2 | 4.97e-1 | **MISMATCH** |
+| num_interior | 2.1200000000e+3 | 2.1200000000e+3 | 0.00e+0 | ok |
+| pres_norm | 4.6436554315e+1 | 4.6436554316e+1 | 9.29e-12 | ok |
 | rhs_norm | 3.4440495882e+0 | 3.4440495882e+0 | 2.58e-16 | ok |
-| sigma_norm | 6.2152264471e+1 | 5.7336605331e+1 | 7.75e-2 | **MISMATCH** |
-| sysmat_fro | 3.9391786943e+1 | 3.9789655417e+1 | 1.00e-2 | **MISMATCH** |
-| uu_norm | 1.4310838414e+1 | 1.4494996372e+1 | 1.27e-2 | **MISMATCH** |
+| sigma_norm | 4.1626603359e+1 | 4.1626603359e+1 | 3.97e-13 | ok |
+| sysmat_fro | 4.0031295366e+1 | 4.0031295366e+1 | 3.02e-15 | ok |
+| uu_norm | 1.5749178610e+1 | 1.5749178610e+1 | 3.90e-13 | ok |
 
-Max relative difference: **4.97e-1** (`pres_norm`)
-Mismatches above tolerance: **5**
+Max relative difference: **9.29e-12** (`pres_norm`)
+Mismatches above tolerance: **0**

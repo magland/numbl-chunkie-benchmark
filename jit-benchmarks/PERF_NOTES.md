@@ -1104,6 +1104,151 @@ The benchmark commits:
 - `5de6f42` PERF_NOTES + README: stage 9 landed (slice write with var source)
 - `e0c2e0e` PERF_NOTES: record stage 9 commit hash and add stage 10-14 sketches
 
+## What was learned landing stages 17, 21, 22 (ex02 Stokes driver)
+
+Following an ex02 Stokes-peanut diagnosis that pinpointed the
+adaptive-quadrature path as the source of ~12s eval-phase slowness
+(forcesmooth experiment: `opts.forcesmooth=true` collapses eval_vel
+from 7.19s to 27ms), three targeted capabilities landed. None moved
+the ex02 eval ratio by much — the actual `adapgausskerneval.m`
+inner loop calls `oneintp` which calls `lege.exev` / a kernel handle
+with tensor-arithmetic-heavy bodies that still bail. But every
+individual capability tested in isolation lands cleanly, unblocks the
+direct matching bail, and is now available for the next stage.
+
+### Stage 17 — multi-dim column slice write `dst(:, j) = src_tensor`
+
+- **New IR**: `AssignIndexCol { baseName, baseType, colIndex,
+  srcBaseName, srcType }`.
+- **Lowering**: `tryLowerColAssign` in `lowerAssignLValue`, dispatched
+  when `lv.indices = [Colon, <scalar_expr>]` on a real 2-D tensor
+  base with an Ident RHS referring to a real-tensor var. Slice-alias
+  names are rejected (they don't correspond to a runtime tensor).
+- **Helper**: `setCol2r_h(dstData, dstRows, dstLen, col, srcData,
+  srcLen)` — bounds-checks `col` against `dstLen/dstRows` and calls
+  `dstData.set(srcData.subarray(0, dstRows), (col-1)*dstRows)`.
+- **Hoist**: dst bumped with arity 2 (so `$d0` alias emits for the
+  row count), src bumped as read-dim-1. No new refresh logic — the
+  stage-6 per-Assign refresh handles dst reassignment (e.g. a
+  `zeros()` reset) for free.
+- **Result**: stage 17 lands at **0.86× matlab** (107ms vs 124ms).
+  RHS restricted to plain Ident — `rss(:, jj) = rval(:, ipti(j))`
+  in chunkerinterior needs an additional RHS-slice-read path that's
+  not yet implemented (stage 17b, deferred).
+
+### Stage 21 — range slice read on RHS `x = src(a:b)`
+
+- **New IR**: `RangeSliceRead { baseName, start, end, jitType }`
+  with `end: JitExpr | null`. A null `end` means the MATLAB `end`
+  keyword — codegen substitutes the hoisted `.data.length` alias.
+- **Lowering**: `tryLowerRangeSliceRead` in `lowerExpr` for both
+  `Index(Ident(src), [Range])` and `FuncCall(src, [Range])` shapes
+  (the parser emits FuncCall when it can't disambiguate, same as
+  stage 5). Range step must be null (default 1). `rangeExpr.end`
+  of type `EndKeyword` is treated specially and does not recurse
+  into `lowerExpr`.
+- **Helper**: `subarrayCopy1r(srcData, srcLen, start, end)` in
+  `jitHelpersIndex.ts` — allocates `new Float64Array(n)` where
+  `n = end - start + 1`, calls `.set(srcData.subarray(start-1,
+  end))`, wraps via `makeTensor` with shape `[n, 1]`.
+- **Hoist**: `collectTensorUsage` bumps the src as read-dim-1.
+  No changes to the other hoist walkers (stage 12, stage 13) were
+  needed — they already used a default `return` for unknown tags.
+- **Result**: stage 21 lands at **1.59× matlab** (312ms vs 197ms).
+  Per-iter allocation dominates — moving to a range-alias
+  (extending stage 5 to Range indices) would close the remaining
+  gap for scalar-only downstream reads. Not required for the
+  ex02 driver; deferred.
+
+### Stage 22 — struct field assign lvalue `s.f = v`
+
+Three base cases to support:
+1. `s = struct(); s.f = v;` — base already a struct in env.
+2. `s = []; s.f = v;` — MATLAB's empty-to-struct promotion idiom.
+3. Write-only local where `s` is not yet in the env.
+
+- **New IR**: `AssignMember { baseName, fieldName, value,
+  needsPromote }`. `needsPromote=true` triggers a `s =
+  $h.structNew_h()` prefix before the field write.
+- **Lowering**: `tryLowerMemberAssign` in `lowerAssignLValue`. Env
+  type after lowering is `struct` with the written field included
+  so subsequent `MemberRead`s can resolve it via stage 12. RHS
+  accepts numeric scalars and real tensors; class instances rejected
+  (would bypass user-defined setters). Empty-tensor base (`tensor`
+  with shape `[0, 0]`) is detected and triggers needsPromote.
+- **Helpers**:
+  - `structNew_h()` — `{ kind: "struct", fields: new Map() }`.
+  - `structSetField_h(s, f, v)` — exported for symmetry but codegen
+    emits `s.fields.set(f, v)` directly to avoid the helper hop.
+  - `structUnshare_h(s)` — clones the Map. Called once at function
+    entry for any **struct param** that is an `AssignMember` target.
+    Preserves MATLAB value semantics: inside `function f(s); s.x =
+    999; end`, the caller's `s3` must not be mutated. Without this,
+    `s.fields.set(...)` leaks through because `RuntimeStruct` has
+    no `_rc` field (no built-in COW).
+- **Stage-12 hoist refinement**: struct-field read hoisting at
+  function entry now skips names that are (a) not params, (b)
+  plain-Assign targets in the body, or (c) `AssignMember` targets in
+  the body. This was required because `s = []; s.f = v` in a loop
+  reassigns `s` to a struct-with-field-f on each iter, which would
+  make a pre-loop `$s_f = s.fields.get("f")` alias stale. Fall
+  through to per-use `s.fields.get("f")` for those cases — slower
+  per read, but correct. Params that are never reassigned or
+  mutated still hoist the same as before (stage 14 untouched).
+- **Helper collectors added**: `collectStructMemberWrites` (finds
+  `AssignMember` targets for the param-unshare pass) and
+  `collectPlainAssignTargets` (for the stage-12 hoist skip).
+- **Result**: stage 22 lands at **0.18× matlab** (23ms vs 126ms).
+  **Caught regression**: `value_class_mutation.m` failed initially
+  because the JIT mutated a caller's struct through the function
+  param. Fixed with the `structUnshare_h` entry-time clone. **Full
+  numbl test suite: 651/651 passed.**
+
+### Stage 23 — integration target (adap inner loop)
+
+- Combines stages 17 + 19. Inner subdivision loop JITs as one
+  function. Still ~58× matlab because:
+  - The anonymous function-handle kernel is interpreted per call
+    (allocates a 2×1 tensor + runs the body through the interpreter).
+  - The outer `for ii = 1:ntarg` loop bails because `vals(:, 1) =
+    kern(-1, 1, x, y)` has a non-Ident RHS (stage 17 requires Ident).
+- For ex02, the real `adapgausskerneval.m:109` inner loop calls
+  `oneintp(...)` — a user function. Even with stages 17 + 22 in, the
+  inner loop bails because `oneintp`'s body has tensor arithmetic
+  (`rs * interpmat`, `bsxfun(@rdivide, ...)`, `sqrt(sum(nint.^2,
+  1))`, etc.) that the JIT doesn't lower.
+
+### What's next for closing the ex02 gap
+
+The remaining blockers are structural, not incremental:
+
+1. **Soft-bail UserCall → dispatch fallback** (highest leverage). If
+   `lowerUserFuncCall` can't lower the callee's body, emit a call
+   through `rt.dispatch` (like stage 19's FuncHandleCall) instead of
+   bailing the whole outer loop. Per-call overhead is real but
+   amortized over JIT-fast scalar work outside the call. Unblocks
+   **every** user-function-in-a-loop pattern without per-function
+   capability expansion. Return-type determined by probing (reuse
+   stage 19's mechanism).
+
+2. **Tensor arithmetic in user-function bodies**. To fully inline
+   `oneintp` and `lege.exev`, the JIT needs matrix multiply, `bsxfun`
+   with function-handle args, `sum(x, dim)`, `sqrt`, `repmat`, etc.
+   producing tensors. This is a long tail.
+
+For ex02 specifically, (1) alone would likely collapse eval_vel to
+well under 2s — the outer adap loop is scalar/tensor-slice/scalar,
+which JITs fine; the expensive callees are rare (per iter) and the
+dispatch cost is dwarfed by their actual work.
+
+### Bench ex02 after stages 17 + 21 + 22
+
+Numbers unchanged within noise vs. pre-stage-17 (~13s execution).
+That confirms the blockers are elsewhere. ex01 Helmholtz similarly
+unchanged. The win of these stages is **correctness + capability
+unlock**, not raw benchmark perf. Follow-up work (especially soft-
+bail) should show the impact.
+
 ## Cheat sheet for the next session
 
 - The fastest way to find a perf bug: dump the JIT JS, paste it into a
